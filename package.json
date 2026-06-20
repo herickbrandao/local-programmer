@@ -1,0 +1,179 @@
+{
+  "name": "local-programmer",
+  "displayName": "Local Programmer AI",
+  "description": "Agente de programação local com Ollama — privado, versionado e com rollback completo",
+  "version": "0.1.0",
+  "publisher": "local-programmer",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "AI",
+    "Programming Languages",
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onView:localProgrammer.chatView"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "local-programmer",
+          "title": "Local Programmer",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "local-programmer": [
+        {
+          "type": "webview",
+          "id": "localProgrammer.chatView",
+          "name": "AI Agent"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "localProgrammer.openChat",
+        "title": "AI: Open Chat",
+        "category": "Local Programmer"
+      },
+      {
+        "command": "localProgrammer.rollbackLast",
+        "title": "AI: Rollback Last Change",
+        "category": "Local Programmer"
+      },
+      {
+        "command": "localProgrammer.restoreVersion",
+        "title": "AI: Restore Version",
+        "category": "Local Programmer"
+      },
+      {
+        "command": "localProgrammer.restoreFile",
+        "title": "AI: Restore File",
+        "category": "Local Programmer"
+      },
+      {
+        "command": "localProgrammer.compareVersions",
+        "title": "AI: Compare Versions",
+        "category": "Local Programmer"
+      },
+      {
+        "command": "localProgrammer.citeFile",
+        "title": "AI: Citar Arquivo no Chat",
+        "category": "Local Programmer"
+      },
+      {
+        "command": "localProgrammer.citeInChat",
+        "title": "AI: Citar Seleção no Chat",
+        "category": "Local Programmer"
+      },
+      {
+        "command": "localProgrammer.indexProject",
+        "title": "AI: Index Project",
+        "category": "Local Programmer"
+      }
+    ],
+    "configuration": {
+      "title": "Local Programmer",
+      "properties": {
+        "localProgrammer.ollamaUrl": {
+          "type": "string",
+          "default": "http://localhost:11434",
+          "description": "URL do servidor Ollama"
+        },
+        "localProgrammer.model": {
+          "type": "string",
+          "default": "qwen2.5-coder:7b",
+          "description": "Modelo Ollama a utilizar"
+        },
+        "localProgrammer.permissionMode": {
+          "type": "string",
+          "enum": [
+            "manual",
+            "smart",
+            "auto"
+          ],
+          "default": "smart",
+          "description": "Modo de permissão: manual (tudo pede aprovação), smart (leitura automática), auto (autonomia com snapshots)"
+        },
+        "localProgrammer.operationMode": {
+          "type": "string",
+          "enum": [
+            "chat",
+            "analyze",
+            "agent"
+          ],
+          "default": "chat",
+          "description": "Modo de operação padrão: chat (só texto), analyze (ler/analisar sem alterar), agent (editar projeto)"
+        },
+        "localProgrammer.maxAgentIterations": {
+          "type": "number",
+          "default": 20,
+          "minimum": 1,
+          "maximum": 100,
+          "description": "Máximo de iterações do agente por prompt"
+        },
+        "localProgrammer.maxResponseTokens": {
+          "type": "number",
+          "default": 8192,
+          "minimum": 256,
+          "maximum": 131072,
+          "description": "Máximo de tokens na resposta do modelo (num_predict no Ollama)"
+        },
+        "localProgrammer.connectionTimeoutMs": {
+          "type": "number",
+          "default": 30000,
+          "minimum": 1000,
+          "maximum": 300000,
+          "description": "Timeout (ms) para conectar e listar modelos do Ollama"
+        },
+        "localProgrammer.requestTimeoutMs": {
+          "type": "number",
+          "default": 300000,
+          "minimum": 5000,
+          "maximum": 3600000,
+          "description": "Timeout (ms) para respostas do chat (modelos grandes precisam de mais tempo)"
+        },
+        "localProgrammer.temperature": {
+          "type": "number",
+          "default": 0.2,
+          "minimum": 0,
+          "maximum": 2,
+          "description": "Temperatura do modelo (0 = determinístico, 2 = criativo)"
+        },
+        "localProgrammer.showThinking": {
+          "type": "boolean",
+          "default": true,
+          "description": "Mostrar mensagens de pensamento/iteração no chat"
+        },
+        "localProgrammer.showToolCalls": {
+          "type": "boolean",
+          "default": true,
+          "description": "Mostrar chamadas de ferramentas no chat"
+        },
+        "localProgrammer.showToolResults": {
+          "type": "boolean",
+          "default": true,
+          "description": "Mostrar resultados das ferramentas no chat"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src --ext ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.3"
+  },
+  "dependencies": {}
+}

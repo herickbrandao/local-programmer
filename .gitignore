@@ -1,0 +1,9 @@
+node_modules/
+out/
+dist/
+*.vsix
+.vscode-test/
+.ai-history/
+.ai-context/
+.ai-settings/
+.DS_Store
