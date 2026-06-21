@@ -154,7 +154,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       type: 'load_session',
       session: this.currentSession,
       sessions: await this.sessionManager.listSessions(),
-      uiMessages: this.uiMessages,
+      uiMessages: this.uiMessages.map((m) => this.serializeUiMessage(m)),
     });
   }
 
@@ -202,9 +202,105 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (!this.currentSession) {
       return;
     }
-    this.currentSession.uiMessages = [...this.uiMessages];
+    this.currentSession.uiMessages = this.uiMessages.map((m) => this.serializeUiMessage(m));
     this.currentSession.agentMessages = this.agent.getConversation();
     await this.sessionManager.saveSession(this.currentSession);
+  }
+
+  /** Não grava conteúdo inteiro de arquivos no JSON — fica em .ai-history */
+  private serializeUiMessage(msg: UiMessage): UiMessage {
+    if (msg.kind !== 'file_change' || !msg.data) {
+      return msg;
+    }
+    if (!msg.data.versionId) {
+      return msg;
+    }
+    const { oldContent: _o, newContent: _n, ...rest } = msg.data;
+    return { ...msg, data: rest };
+  }
+
+  private findStoredFileChange(file: string): UiMessage | undefined {
+    return [...this.uiMessages]
+      .reverse()
+      .find((m) => m.kind === 'file_change' && m.data?.file === file);
+  }
+
+  private async resolveVersionIdForFile(
+    file: string,
+    hint?: string | null
+  ): Promise<string | null> {
+    if (hint) {
+      return hint;
+    }
+    const versions = await this.snapshotManager.listVersions();
+    for (let i = versions.length - 1; i >= 0; i--) {
+      if (versions[i].changes.some((c) => c.file === file)) {
+        return versions[i].id;
+      }
+    }
+    return null;
+  }
+
+  private async resolveCompareContents(data: {
+    file: string;
+    oldContent?: string;
+    newContent?: string;
+    versionId?: string | null;
+  }): Promise<{ oldContent: string; newContent: string }> {
+    const folders = vscode.workspace.workspaceFolders;
+    if (folders?.[0]) {
+      await this.snapshotManager.initialize(folders[0].uri.fsPath);
+    }
+
+    let oldContent = data.oldContent ?? '';
+    let newContent = data.newContent ?? '';
+
+    const stored = this.findStoredFileChange(data.file);
+    const versionId = await this.resolveVersionIdForFile(
+      data.file,
+      data.versionId ?? (stored?.data?.versionId as string | undefined)
+    );
+
+    if (versionId) {
+      const fromSnapshotOld = await this.snapshotManager.getVersionFile(
+        versionId,
+        data.file,
+        'before'
+      );
+      const fromSnapshotNew = await this.snapshotManager.getVersionFile(
+        versionId,
+        data.file,
+        'after'
+      );
+      if (fromSnapshotOld !== null) {
+        oldContent = fromSnapshotOld;
+      }
+      if (fromSnapshotNew !== null) {
+        newContent = fromSnapshotNew;
+      }
+    }
+
+    if (!oldContent || !newContent) {
+      if (stored?.data) {
+        if (!oldContent && stored.data.oldContent) {
+          oldContent = String(stored.data.oldContent);
+        }
+        if (!newContent && stored.data.newContent) {
+          newContent = String(stored.data.newContent);
+        }
+      }
+    }
+
+    if (folders?.[0] && !newContent) {
+      const fullPath = path.join(folders[0].uri.fsPath, data.file);
+      try {
+        newContent = await fs.readFile(fullPath, 'utf-8');
+      } catch {
+        // mantém vazio
+      }
+    }
+
+    return { oldContent, newContent };
   }
 
   private pushUiMessage(msg: UiMessage): void {
@@ -221,7 +317,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       type: 'load_session',
       session: this.currentSession,
       sessions: await this.sessionManager.listSessions(),
-      uiMessages: this.uiMessages,
+      uiMessages: this.uiMessages.map((m) => this.serializeUiMessage(m)),
     });
   }
 
@@ -238,7 +334,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       type: 'load_session',
       session,
       sessions: await this.sessionManager.listSessions(),
-      uiMessages: this.uiMessages,
+      uiMessages: this.uiMessages.map((m) => this.serializeUiMessage(m)),
     });
   }
 
@@ -279,20 +375,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private async onCompareFile(data: {
     file: string;
-    oldContent: string;
-    newContent: string;
+    oldContent?: string;
+    newContent?: string;
+    versionId?: string | null;
   }): Promise<void> {
-    const folders = vscode.workspace.workspaceFolders;
-    let newContent = data.newContent ?? '';
-    let oldContent = data.oldContent ?? '';
+    const { oldContent, newContent } = await this.resolveCompareContents(data);
 
-    if (folders) {
-      const fullPath = path.join(folders[0].uri.fsPath, data.file);
-      try {
-        newContent = await fs.readFile(fullPath, 'utf-8');
-      } catch {
-        // mantém conteúdo armazenado no card
-      }
+    if (!oldContent && !newContent) {
+      vscode.window.showWarningMessage(
+        `Não há versão salva para comparar "${data.file}". Faça uma alteração com a IA primeiro.`
+      );
+      return;
     }
 
     const oldUri = createDiffContentUri('local-programmer-old', data.file, oldContent);
@@ -546,6 +639,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         if (existing?.data) {
           existing.data.versionId = data.versionId;
           existing.data.persisted = true;
+          delete existing.data.oldContent;
+          delete existing.data.newContent;
           void this.persistSession();
           this.postMessage({ type: 'update_file_change', data: existing.data });
         }

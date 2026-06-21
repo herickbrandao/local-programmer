@@ -15,7 +15,8 @@ export class VirtualDiffContentStore {
   }
 
   static createUri(scheme: string, filePath: string, content: string): vscode.Uri {
-    const key = `${++contentCounter}-${filePath.replace(/[^\w.-]/g, '_')}`;
+    const safeName = filePath.replace(/[^\w.-]/g, '_');
+    const key = `${Date.now()}-${++contentCounter}-${safeName}`;
     this.contents.set(key, content);
     return vscode.Uri.from({
       scheme,
