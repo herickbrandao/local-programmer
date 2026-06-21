@@ -50,7 +50,7 @@ export function classifyMessageIntent(prompt: string): MessageIntent {
     return 'conversational';
   }
 
-  if (WRITE_PATTERN.test(text) || IMPLEMENT_PATTERN.test(text)) {
+  if (WRITE_PATTERN.test(text) || IMPLEMENT_PATTERN.test(text) || looksLikeFixOrImproveRequest(text)) {
     return 'project_write';
   }
 
@@ -73,9 +73,16 @@ export function classifyMessageIntent(prompt: string): MessageIntent {
   return 'conversational';
 }
 
+const FIX_AND_DIAGNOSE_PATTERN =
+  /\b(analis[ea].*(faz|fazer|corrig|arrum|consert|implement|melhor)|ver o que d[aá]|o que d[aá] pra fazer|n[aã]o consegue|nunca consegue|n[aã]o funciona|n[aã]o t[aá]|bug|problema|arrum|consert|corrig|refator|polir|fazer funcionar)\b/iu;
+
+export function looksLikeFixOrImproveRequest(prompt: string): boolean {
+  return FIX_AND_DIAGNOSE_PATTERN.test(prompt.trim());
+}
+
 export function looksLikeImplementationRequest(prompt: string): boolean {
   const text = prompt.trim();
-  return WRITE_PATTERN.test(text) || IMPLEMENT_PATTERN.test(text);
+  return WRITE_PATTERN.test(text) || IMPLEMENT_PATTERN.test(text) || looksLikeFixOrImproveRequest(text);
 }
 
 export function resolveEffectiveIntent(
@@ -87,12 +94,18 @@ export function resolveEffectiveIntent(
     return classified;
   }
   if (classified === 'conversational') {
+    if (looksLikeFixOrImproveRequest(prompt) || looksLikeImplementationRequest(prompt)) {
+      return 'project_write';
+    }
     return classified;
   }
   if (classified === 'project_write') {
     return classified;
   }
-  if (READ_ONLY_PATTERN.test(prompt) && !looksLikeImplementationRequest(prompt)) {
+  if (looksLikeFixOrImproveRequest(prompt) || looksLikeImplementationRequest(prompt)) {
+    return 'project_write';
+  }
+  if (READ_ONLY_PATTERN.test(prompt)) {
     return 'project_read';
   }
   return 'project_write';

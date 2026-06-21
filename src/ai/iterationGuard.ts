@@ -6,6 +6,7 @@ export class IterationGuard {
   private failedAttempts = new Map<string, number>();
   private consecutiveEmptyIterations = 0;
   private completedWrites = new Map<string, string>();
+  private failedSearchQueries = new Set<string>();
 
   static fingerprint(toolName: string, args: Record<string, unknown>): string {
     return `${toolName}:${JSON.stringify(args)}`;
@@ -19,6 +20,15 @@ export class IterationGuard {
     toolName: string,
     args: Record<string, unknown>
   ): IterationStopReason | null {
+    if (toolName === 'search_files') {
+      const query = String(args.query ?? '').trim().toLowerCase();
+      if (query && this.failedSearchQueries.has(query)) {
+        return {
+          message: `Busca "${args.query}" já retornou vazio. Use edit_file replace_lines com linhas do read_file.`,
+        };
+      }
+    }
+
     const filePath = args.path as string | undefined;
     if (!filePath) {
       return null;
@@ -56,6 +66,18 @@ export class IterationGuard {
     let fp = IterationGuard.fingerprint(toolName, args);
     const recoverableEdit = !success && this.isRecoverableEditFailure(toolName, output);
 
+    if (!success && toolName === 'read_file' && (
+      output.includes('Leitura bloqueada')
+      || output.includes('read_file bloqueado')
+      || output.includes('já lido por completo')
+    )) {
+      return null;
+    }
+
+    if (!success && toolName === 'read_file') {
+      fp = `read_file-fail:${String(args.path ?? 'unknown')}`;
+    }
+
     if (!success && toolName === 'edit_file') {
       fp = `edit_file-fail:${String(args.path ?? 'unknown')}`;
     }
@@ -65,14 +87,25 @@ export class IterationGuard {
       return null;
     }
 
+    if (toolName === 'search_files' && output.includes('Nenhum resultado')) {
+      const query = String(args.query ?? '').trim().toLowerCase();
+      if (query) {
+        this.failedSearchQueries.add(query);
+      }
+    }
+
     const count = (this.failedAttempts.get(fp) ?? 0) + 1;
     this.failedAttempts.set(fp, count);
 
-    if (recoverableEdit && count < 6) {
+    if (recoverableEdit && count < 8) {
       return null;
     }
 
-    if (count >= 2) {
+    if (toolName === 'read_file' && count < 8) {
+      return null;
+    }
+
+    if (count >= 3) {
       return {
         message: `Interrompido: a mesma ação falhou ${count} vezes sem progresso.\nÚltimo erro: ${output}`,
       };
@@ -99,14 +132,18 @@ export class IterationGuard {
       || output.includes('replace_lines');
   }
 
-  finishIteration(hadSuccess: boolean): IterationStopReason | null {
+  finishIteration(hadSuccess: boolean, hadBlockedRead = false): IterationStopReason | null {
     if (hadSuccess) {
       this.consecutiveEmptyIterations = 0;
       return null;
     }
 
+    if (hadBlockedRead) {
+      return null;
+    }
+
     this.consecutiveEmptyIterations++;
-    if (this.consecutiveEmptyIterations >= 2) {
+    if (this.consecutiveEmptyIterations >= 4) {
       return {
         message: 'Interrompido: o agente não conseguiu progresso nas últimas iterações.',
       };
@@ -126,5 +163,6 @@ export class IterationGuard {
     this.failedAttempts.clear();
     this.consecutiveEmptyIterations = 0;
     this.completedWrites.clear();
+    this.failedSearchQueries.clear();
   }
 }

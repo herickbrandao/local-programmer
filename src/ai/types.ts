@@ -17,6 +17,8 @@ export interface ChatOptions {
   temperature?: number;
   tools?: ToolDefinition[];
   maxResponseTokens?: number;
+  /** Ollama: força o modelo a emitir tool_calls em vez de só texto */
+  requireToolCall?: boolean;
 }
 
 export interface ToolDefinition {

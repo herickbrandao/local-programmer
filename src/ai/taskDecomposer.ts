@@ -59,6 +59,9 @@ export function mightBenefitFromDecomposition(prompt: string, intent: MessageInt
   if (intent === 'conversational') {
     return false;
   }
+  if (inferEditorSubtasks(prompt, intent)) {
+    return true;
+  }
   if (isSimpleWriteRequest(prompt)) {
     return false;
   }
@@ -123,7 +126,32 @@ function parseDecompositionJson(content: string): TaskDecomposition | null {
   }
 }
 
+function inferEditorSubtasks(prompt: string, intent: MessageIntent): TaskDecomposition | null {
+  if (intent !== 'project_write') {
+    return null;
+  }
+  const uiTask = /bonito|beleza|layout|front-?end|visual|design|moderniz|embelez|polir|melhorar.*(ui|interface|front|tela|chat)/i.test(prompt);
+  if (!uiTask) {
+    return null;
+  }
+  return {
+    decomposed: true,
+    originalGoal: prompt,
+    subtasks: [
+      'Ler src/ui/panelHtml.ts (CSS em getPanelHtml, linhas ~8–400)',
+      'edit_file replace_lines: melhorar CSS (espaçamento, cores, tipografia, containers, mensagens)',
+      'Ler/editar outros arquivos de UI se necessário (ex: chatViewProvider.ts)',
+      'test_project — validar compilação',
+    ],
+  };
+}
+
 function heuristicDecomposition(prompt: string): TaskDecomposition | null {
+  const editor = inferEditorSubtasks(prompt, 'project_write');
+  if (editor) {
+    return editor;
+  }
+
   const numbered = splitNumberedOrBulletedList(prompt);
   if (numbered) {
     return { decomposed: true, originalGoal: prompt, subtasks: numbered };

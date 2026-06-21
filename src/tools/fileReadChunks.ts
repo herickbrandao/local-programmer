@@ -13,6 +13,50 @@ export interface FileReadCoverageEntry {
 
 export type FileReadCoverageMap = Record<string, FileReadCoverageEntry>;
 
+export function normalizeRelPath(filePath: string): string {
+  return filePath.trim().replace(/\\/g, '/').replace(/^\.\//, '');
+}
+
+export function getCoverageEntry(
+  coverage: FileReadCoverageMap,
+  filePath: string
+): FileReadCoverageEntry | undefined {
+  const norm = normalizeRelPath(filePath).toLowerCase();
+  const direct = coverage[normalizeRelPath(filePath)];
+  if (direct) {
+    return direct;
+  }
+  for (const [key, entry] of Object.entries(coverage)) {
+    const keyNorm = normalizeRelPath(key).toLowerCase();
+    if (keyNorm === norm || keyNorm.endsWith(`/${norm}`) || norm.endsWith(`/${keyNorm}`)) {
+      return entry;
+    }
+  }
+  return undefined;
+}
+
+export function getNextUnreadRange(
+  coverage: FileReadCoverageMap,
+  filePath: string,
+  maxSpan = DEFAULT_CHUNK_LINES
+): { start: number; end: number } | null {
+  const entry = getCoverageEntry(coverage, filePath);
+  if (!entry || entry.ranges.length === 0) {
+    return null;
+  }
+  if (isFileFullyRead(coverage, filePath)) {
+    return null;
+  }
+  const next = Math.max(...entry.ranges.map((r) => r.to), 0) + 1;
+  if (next > entry.totalLines) {
+    return null;
+  }
+  return {
+    start: next,
+    end: Math.min(entry.totalLines, next + maxSpan - 1),
+  };
+}
+
 export function resolveReadRange(
   totalLines: number,
   startLine?: number,
@@ -100,11 +144,12 @@ export function recordReadRange(
   to: number,
   totalLines: number
 ): void {
-  const existing = coverage[filePath] ?? { totalLines, ranges: [] };
+  const key = normalizeRelPath(filePath);
+  const existing = getCoverageEntry(coverage, filePath) ?? coverage[key] ?? { totalLines, ranges: [] };
   existing.totalLines = totalLines;
   existing.ranges.push({ from, to });
   existing.ranges.sort((a, b) => a.from - b.from);
-  coverage[filePath] = existing;
+  coverage[key] = existing;
 }
 
 export function isRangeFullyRead(
@@ -113,7 +158,7 @@ export function isRangeFullyRead(
   from: number,
   to: number
 ): boolean {
-  const entry = coverage[filePath];
+  const entry = getCoverageEntry(coverage, filePath);
   if (!entry) {
     return false;
   }
@@ -121,7 +166,7 @@ export function isRangeFullyRead(
 }
 
 export function isFileFullyRead(coverage: FileReadCoverageMap, filePath: string): boolean {
-  const entry = coverage[filePath];
+  const entry = getCoverageEntry(coverage, filePath);
   if (!entry || entry.ranges.length === 0) {
     return false;
   }

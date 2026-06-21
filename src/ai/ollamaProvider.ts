@@ -187,6 +187,9 @@ export class OllamaProvider implements AIProvider {
           parameters: t.parameters,
         },
       }));
+      if (options.requireToolCall) {
+        body.tool_choice = 'required';
+      }
     }
 
     const response = await httpRequest(`${this.getUrl()}/api/chat`, {

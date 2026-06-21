@@ -1,7 +1,7 @@
 import { FileChange } from './types';
 import { MessageIntent } from './messageIntent';
 import { TaskPlan } from './taskDecomposer';
-import { ExecutionPhase, buildImplementPhaseMessage, createInitialPhase } from './executionPhase';
+import { ExecutionPhase, buildImplementPhaseMessage, createInitialPhase, needsMoreFileWork, listFilesReadyToEdit } from './executionPhase';
 import { FileReadCoverageMap, formatCoverageSummary } from '../tools/fileReadChunks';
 
 export interface TaskState {
@@ -18,6 +18,8 @@ export interface TaskState {
   forceImplement: boolean;
   fileReadCounts: Record<string, number>;
   fileReadCoverage: FileReadCoverageMap;
+  /** Evita repetir aviso de modo editor na mesma sessão */
+  editorModeAnnounced?: boolean;
 }
 
 export function createTaskState(goal: string, intent: MessageIntent): TaskState {
@@ -69,6 +71,10 @@ export function buildTaskContextBlock(state: TaskState, phaseContext = ''): stri
   }
   if (changed.length > 0) {
     lines.push(`Arquivos já alterados: ${changed.join(', ')}`);
+    const pendingEdit = listFilesReadyToEdit(state);
+    if (pendingEdit.length > 0) {
+      lines.push(`⚠ Ainda editar: ${pendingEdit.join(', ')}`);
+    }
   } else if (state.intent === 'project_write') {
     lines.push('⚠ Ainda NENHUM arquivo foi alterado — use edit_file replace_lines (números do read_file).');
   }
@@ -81,9 +87,11 @@ export function shouldAutoContinue(
   state: TaskState,
   toolsMode: string,
   sessionChanges: FileChange[],
-  hadToolCalls: boolean
+  _hadToolCalls: boolean,
+  userPrompt?: string
 ): boolean {
-  if (state.continuationCount >= 12) {
+  const maxContinuations = 25;
+  if (state.continuationCount >= maxContinuations) {
     return false;
   }
   if (toolsMode !== 'agent') {
@@ -92,19 +100,30 @@ export function shouldAutoContinue(
   if (state.intent !== 'project_write') {
     return false;
   }
+
   if (sessionChanges.length > 0) {
-    return false;
+    return needsMoreFileWork(state, userPrompt ?? state.goal, sessionChanges);
   }
 
-  // Pedido de alteração: resposta só texto sem editar → continuar até implementar
-  if (!hadToolCalls) {
-    if (state.filesRead.size > 0) {
-      state.forceImplement = true;
-    }
-    return true;
+  if (state.filesRead.size > 0) {
+    state.forceImplement = true;
   }
+  return true;
+}
 
-  return false;
+export function buildTaskIncompleteMessage(state: TaskState, userPrompt: string): string {
+  const read = [...state.filesRead];
+  const pendingEdit = listFilesReadyToEdit(state);
+  return [
+    'Não foi possível aplicar alterações após várias tentativas automáticas.',
+    '',
+    `**Pedido:** ${state.goal || userPrompt}`,
+    read.length > 0 ? `**Arquivos lidos:** ${read.join(', ')}` : '',
+    state.filesChanged.length > 0 ? `**Já alterados:** ${state.filesChanged.join(', ')}` : '',
+    pendingEdit.length > 0 ? `**Pendentes:** ${pendingEdit.join(', ')}` : '',
+    '',
+    'Dica: cite o arquivo e trecho desejado (ex.: `@src/ui/panelHtml.ts:90-120`) ou use um modelo maior no Ollama.',
+  ].filter(Boolean).join('\n');
 }
 
 export function buildContinuationMessage(state: TaskState, userPrompt?: string): string {
@@ -116,7 +135,7 @@ export function buildContinuationMessage(state: TaskState, userPrompt?: string):
     '[Continuação automática — complete a tarefa]',
     `Objetivo original: ${state.goal}`,
     read.length > 0 ? `Você já leu: ${read.join(', ')}` : '',
-    'Use edit_file replace_lines (start_line/end_line do read_file). Opcional: verify_content.',
+    'Use edit_file replace_lines nos arquivos já lidos. Leia outros arquivos se o pedido envolver mais de um.',
     'Depois chame test_project para validar. Não reescreva arquivos inteiros.',
   ].filter(Boolean).join('\n');
 }

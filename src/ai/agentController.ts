@@ -16,17 +16,26 @@ import {
 } from './taskDecomposer';
 import {
   buildImplementPhaseMessage,
+  buildImplementProgressMessage,
   buildEditRecoveryHint,
+  buildForceEditAfterReadMessage,
+  buildMandatoryEditMessage,
+  buildMultiFileEditContinueMessage,
   buildPhaseContextBlock,
+  coerceImplementPhaseRead,
   filterToolsForPhase,
   finishToolIteration,
   getToolBlockReason,
+  needsMoreFileWork,
+  pickPrimaryEditTarget,
   recordReadTool,
+  shouldUseEditOnlyTools,
   updateExecutionPhase,
 } from './executionPhase';
 import {
   buildContinuationMessage,
   buildTaskContextBlock,
+  buildTaskIncompleteMessage,
   createTaskState,
   shouldAutoContinue,
   TaskState,
@@ -34,10 +43,9 @@ import {
 import { TokenTracker } from './tokenTracker';
 import { assessResponseQuality, buildRefinementPrompt, isAgentImplementationTask, isResponseTruncated, synthesizeFinalAnswer } from './responseValidator';
 import * as fs from 'fs/promises';
-import { recordReadRange } from '../tools/fileReadChunks';
+import { recordReadRange, isFileFullyRead } from '../tools/fileReadChunks';
 import { normalizeToolArgs, resolveWorkspacePath } from '../tools/pathUtils';
-import {
-  AgentEvent,
+import { AIProvider, AgentEvent,
   ChatMessage,
   FileChange,
   PermissionRequest,
@@ -49,6 +57,7 @@ import { PermissionManager } from '../permissions/permissionManager';
 import { SnapshotManager } from '../history/snapshotManager';
 import { DiffManager } from '../editor/diffManager';
 import { ContextManager } from '../workspace/contextManager';
+import { attemptForcedEdit, buildEditSuccessMessage } from './editorFallback';
 
 export class AgentController {
   private promptManager = new PromptManager();
@@ -264,6 +273,16 @@ export class AgentController {
         taskState.filesChanged = sessionChanges.map((c) => c.file);
         this.refreshSystemPrompt(mode, taskState, projectContext, effectiveIntent, resolved.toolsMode);
 
+        if (shouldUseEditOnlyTools(taskState, userPrompt) && !taskState.editorModeAnnounced) {
+          taskState.editorModeAnnounced = true;
+          this.messages.push({
+            role: 'user',
+            content: buildMandatoryEditMessage(taskState, userPrompt),
+            internal: true,
+          });
+          this.emit({ type: 'thinking', content: 'Modo editor — implementação obrigatória...' });
+        }
+
         if (resolved.showIterations && resolved.toolsMode !== 'chat') {
           const iterLabel = decomposition.decomposed
             ? `Etapa ${subIdx + 1}/${subtaskCount} · iteração ${i + 1}/${subtaskMaxIterations}...`
@@ -278,15 +297,18 @@ export class AgentController {
               this.promptManager.getToolDefinitionsForIntent(resolved.toolsMode, effectiveIntent),
               taskState.phase,
               effectiveIntent,
-              resolved.toolsMode
+              resolved.toolsMode,
+              taskState
             )
             : [];
         forceTextOnly = false;
         const tools = toolDefs;
 
+        const editOnlyMode = shouldUseEditOnlyTools(taskState, userPrompt);
         const response = await provider.chat(this.messages, {
           model,
           tools: tools.length > 0 ? tools : undefined,
+          requireToolCall: editOnlyMode && tools.length > 0,
           maxResponseTokens: settings.maxResponseTokens,
         });
 
@@ -311,6 +333,8 @@ export class AgentController {
           let iterationHadSuccess = false;
           let iterationHadWrite = false;
           let iterationHadReadOnly = false;
+          let iterationHadBlockedRead = false;
+          let lastFullyReadFile: string | undefined;
 
           for (const toolCall of response.toolCalls) {
             if (!this.promptManager.isToolAllowed(resolved.toolsMode, toolCall.name, effectiveIntent)) {
@@ -344,7 +368,11 @@ export class AgentController {
               continue;
             }
 
-            const normalizedArgs = normalizeToolArgs(this.workspaceRoot, args);
+            const normalizedArgs = coerceImplementPhaseRead(
+              normalizeToolArgs(this.workspaceRoot, args),
+              taskState,
+              taskState.phase
+            );
             const filePath = normalizedArgs.path as string | undefined;
 
             const blockReason = getToolBlockReason(
@@ -356,6 +384,9 @@ export class AgentController {
               effectiveIntent
             );
             if (blockReason) {
+              if (toolCall.name === 'read_file' || toolCall.name === 'search_files') {
+                iterationHadBlockedRead = true;
+              }
               this.emit({ type: 'tool_result', content: blockReason, data: { success: false } });
               this.messages.push({
                 role: 'tool',
@@ -363,12 +394,25 @@ export class AgentController {
                 name: toolCall.name,
                 toolCallId: toolCall.id,
               });
-              const hint = buildEditRecoveryHint(normalizedArgs, blockReason);
-              if (hint) {
-                this.messages.push({ role: 'user', content: hint, internal: true });
+              const target = filePath ?? pickPrimaryEditTarget(taskState, userPrompt);
+              if (
+                target
+                && toolCall.name === 'read_file'
+                && isFileFullyRead(taskState.fileReadCoverage, target)
+              ) {
+                this.messages.push({
+                  role: 'user',
+                  content: buildForceEditAfterReadMessage(taskState, target),
+                  internal: true,
+                });
+              } else {
+                const hint = buildEditRecoveryHint(normalizedArgs, blockReason);
+                if (hint) {
+                  this.messages.push({ role: 'user', content: hint, internal: true });
+                }
               }
               const stop = iterationGuard.recordToolResult(toolCall.name, normalizedArgs, false, blockReason);
-              if (stop) {
+              if (stop && toolCall.name !== 'read_file') {
                 this.stopAgentLoop(stop.message);
                 stoppedEarly = true;
                 break;
@@ -378,6 +422,16 @@ export class AgentController {
 
             const redundant = iterationGuard.checkRedundantAction(toolCall.name, normalizedArgs);
             if (redundant) {
+              if (toolCall.name === 'search_files') {
+                this.emit({ type: 'tool_result', content: redundant.message, data: { success: false } });
+                this.messages.push({
+                  role: 'tool',
+                  content: redundant.message,
+                  name: toolCall.name,
+                  toolCallId: toolCall.id,
+                });
+                continue;
+              }
               this.stopAgentLoop(redundant.message);
               stoppedEarly = true;
               break;
@@ -427,11 +481,16 @@ export class AgentController {
 
             if (result.success && toolCall.name === 'read_file' && filePath) {
               updateExecutionPhase(taskState, resolved.toolsMode);
+              if (isFileFullyRead(taskState.fileReadCoverage, filePath)) {
+                lastFullyReadFile = filePath;
+              }
             }
 
             this.emit({
               type: 'tool_result',
-              content: result.output.substring(0, 500),
+              content: result.output.length > 2500
+                ? `${result.output.substring(0, 2500)}\n… (${result.output.length} caracteres — modelo recebeu o trecho completo)`
+                : result.output,
               data: { success: result.success },
             });
 
@@ -475,30 +534,71 @@ export class AgentController {
             && iterationHadSuccess
             && !iterationHadWrite
           ) {
+            const fileJustFullyRead = lastFullyReadFile;
+
             this.messages.push({
               role: 'user',
-              content: buildImplementPhaseMessage(taskState, userPrompt),
+              content: fileJustFullyRead
+                ? buildForceEditAfterReadMessage(taskState, fileJustFullyRead)
+                : buildImplementProgressMessage(taskState, userPrompt),
               internal: true,
             });
-            this.emit({ type: 'thinking', content: 'Aguardando alteração no código...' });
+            this.emit({
+              type: 'thinking',
+              content: fileJustFullyRead
+                ? `\`${fileJustFullyRead}\` lido — edite ou leia outro arquivo`
+                : 'Aguardando alteração ou próxima leitura...',
+            });
+          }
+
+          if (
+            iterationHadWrite
+            && needsMoreFileWork(taskState, userPrompt, sessionChanges)
+          ) {
+            this.messages.push({
+              role: 'user',
+              content: buildMultiFileEditContinueMessage(taskState, userPrompt),
+              internal: true,
+            });
+            this.emit({
+              type: 'thinking',
+              content: 'Continuando edição nos próximos arquivos...',
+            });
           }
 
           const taskDone = checkWriteTaskComplete(userPrompt, sessionChanges);
-          if (taskDone && iterationHadSuccess) {
+          if (taskDone && iterationHadSuccess && !needsMoreFileWork(taskState, userPrompt, sessionChanges)) {
             this.stopAgentLoop(taskDone);
             stoppedEarly = true;
             break;
           }
 
-          const iterationStop = iterationGuard.finishIteration(iterationHadSuccess);
+          const iterationStop = iterationGuard.finishIteration(iterationHadSuccess, iterationHadBlockedRead);
           if (iterationStop) {
+            if (
+              isAgentImplementationTask(effectiveIntent, resolved.toolsMode)
+              && sessionChanges.length === 0
+            ) {
+              const forcedOk = await this.attemptForcedEditAndExecute(
+                provider,
+                model,
+                taskState,
+                userPrompt,
+                pendingChanges,
+                sessionChanges
+              );
+              if (forcedOk) {
+                stoppedEarly = true;
+                break;
+              }
+            }
             this.stopAgentLoop(iterationStop.message);
             stoppedEarly = true;
             break;
           }
         } else {
           if (
-            shouldAutoContinue(taskState, resolved.toolsMode, sessionChanges, false)
+            shouldAutoContinue(taskState, resolved.toolsMode, sessionChanges, false, userPrompt)
           ) {
             if (response.content.trim()) {
               this.messages.push({ role: 'assistant', content: response.content });
@@ -512,15 +612,54 @@ export class AgentController {
             });
             this.emit({
               type: 'thinking',
-              content: `Continuando implementação (${taskState.continuationCount}/12)...`,
+              content: `Continuando implementação (${taskState.continuationCount}/25)...`,
+            });
+            continue;
+          }
+
+          const agentWriteTask = isAgentImplementationTask(effectiveIntent, resolved.toolsMode);
+
+          if (agentWriteTask && (sessionChanges.length === 0 || needsMoreFileWork(taskState, userPrompt, sessionChanges))) {
+            if (taskState.continuationCount >= 25) {
+              const forcedOk = await this.attemptForcedEditAndExecute(
+                provider,
+                model,
+                taskState,
+                userPrompt,
+                pendingChanges,
+                sessionChanges
+              );
+              if (!forcedOk) {
+                this.stopAgentLoop(buildTaskIncompleteMessage(taskState, userPrompt));
+              }
+              stoppedEarly = true;
+              break;
+            }
+            if (response.content.trim()) {
+              this.messages.push({ role: 'assistant', content: response.content });
+            }
+            taskState.continuationCount += 1;
+            taskState.forceImplement = true;
+            this.messages.push({
+              role: 'user',
+              content: sessionChanges.length > 0
+                ? buildMultiFileEditContinueMessage(taskState, userPrompt)
+                : buildImplementProgressMessage(taskState, userPrompt),
+              internal: true,
+            });
+            this.emit({
+              type: 'thinking',
+              content: sessionChanges.length > 0
+                ? 'Ainda há arquivos para editar...'
+                : response.content.trim()
+                  ? 'Resposta sem alteração no código — exigindo edit_file...'
+                  : `Aguardando edit_file (${taskState.continuationCount}/25)...`,
             });
             continue;
           }
 
           const generationComplete = response.done !== false
             && response.doneReason !== 'length';
-
-          const agentWriteTask = isAgentImplementationTask(effectiveIntent, resolved.toolsMode);
 
           if (
             resolved.toolsMode !== 'agent'
@@ -642,9 +781,11 @@ export class AgentController {
           }
 
           this.messages.push({ role: 'assistant', content: response.content });
+          const finalContent = response.content.trim()
+            || 'Tarefa encerrada. Revise o projeto ou reformule o pedido.';
           this.emit({
             type: 'message',
-            content: response.content,
+            content: finalContent,
             data: { role: 'assistant' },
           });
           stoppedEarly = true;
@@ -653,6 +794,25 @@ export class AgentController {
         }
 
         if (stoppedEarly) {
+          break;
+        }
+
+        if (
+          isAgentImplementationTask(effectiveIntent, resolved.toolsMode)
+          && sessionChanges.length === 0
+        ) {
+          const forcedOk = await this.attemptForcedEditAndExecute(
+            provider,
+            model,
+            taskState,
+            userPrompt,
+            pendingChanges,
+            sessionChanges
+          );
+          if (!forcedOk) {
+            this.stopAgentLoop(buildTaskIncompleteMessage(taskState, userPrompt));
+          }
+          stoppedEarly = true;
           break;
         }
 
@@ -702,12 +862,19 @@ export class AgentController {
         resolved.toolsMode === 'agent'
         && effectiveIntent === 'project_write'
         && sessionChanges.length === 0
-        && taskState.continuationCount === 0
+        && !stoppedEarly
       ) {
-        this.emit({
-          type: 'thinking',
-          content: 'A tarefa não gerou alterações — tentando concluir...',
-        });
+        const forcedOk = await this.attemptForcedEditAndExecute(
+          provider,
+          model,
+          taskState,
+          userPrompt,
+          pendingChanges,
+          sessionChanges
+        );
+        if (!forcedOk) {
+          this.stopAgentLoop(buildTaskIncompleteMessage(taskState, userPrompt));
+        }
       }
 
       if (resolved.toolsMode === 'agent' && sessionChanges.length > 0) {
@@ -810,6 +977,83 @@ export class AgentController {
       content: message,
       data: { role: 'assistant' },
     });
+  }
+
+  /** Último recurso: gera e executa edit_file quando o modelo só responde texto */
+  private async attemptForcedEditAndExecute(
+    provider: AIProvider,
+    model: string,
+    taskState: TaskState,
+    userPrompt: string,
+    pendingChanges: PendingChange[],
+    sessionChanges: FileChange[]
+  ): Promise<boolean> {
+    const maxAttempts = 3;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      this.emit({
+        type: 'thinking',
+        content: `Aplicando edição automaticamente (${attempt}/${maxAttempts})...`,
+      });
+
+      const forced = await attemptForcedEdit(
+        provider,
+        model,
+        this.workspaceRoot,
+        taskState,
+        userPrompt,
+        attempt
+      );
+
+      if (!forced.success || !forced.args) {
+        continue;
+      }
+
+      const normalizedArgs = coerceImplementPhaseRead(
+        normalizeToolArgs(this.workspaceRoot, forced.args),
+        taskState,
+        'implement'
+      );
+
+      this.emit({
+        type: 'tool_call',
+        content: `edit_file(forced: ${JSON.stringify(normalizedArgs)})`,
+        data: { name: 'edit_file', arguments: normalizedArgs },
+      });
+
+      const result = await this.executeToolWithPermission(
+        'edit_file',
+        normalizedArgs,
+        pendingChanges,
+        sessionChanges,
+        taskState
+      );
+
+      this.emit({
+        type: 'tool_result',
+        content: result.output.length > 2500
+          ? `${result.output.substring(0, 2500)}\n…`
+          : result.output,
+        data: { success: result.success },
+      });
+
+      if (result.success) {
+        taskState.filesChanged = sessionChanges.map((c) => c.file);
+        const msg = buildEditSuccessMessage(
+          sessionChanges.map((c) => c.file),
+          taskState.goal || userPrompt
+        );
+        this.stopAgentLoop(msg);
+        return true;
+      }
+
+      this.messages.push({
+        role: 'user',
+        content: `[Edição forçada falhou — tente linhas diferentes]\n${result.output}`,
+        internal: true,
+      });
+    }
+
+    return false;
   }
 
   private refreshSystemPrompt(

@@ -3,7 +3,8 @@ import { ToolDefinition } from './types';
 import { MessageIntent } from './messageIntent';
 import type { TaskState } from './taskTracker';
 import { extractFilenamesFromPrompt } from './taskCompletion';
-import { isFileFullyRead, isRangeFullyRead } from '../tools/fileReadChunks';
+import { isFileFullyRead, getCoverageEntry, getNextUnreadRange } from '../tools/fileReadChunks';
+import { FileChange } from './types';
 
 export type ExecutionPhase = 'explore' | 'implement';
 
@@ -35,8 +36,18 @@ export function updateExecutionPhase(state: TaskState, toolsMode: string): void 
     return;
   }
 
-  if (state.filesChanged.length > 0) {
+  if (shouldUseEditOnlyTools(state, state.goal)) {
+    state.phase = 'implement';
+    state.forceImplement = true;
     return;
+  }
+
+  if (state.filesChanged.length > 0) {
+    const moreEdit = listFilesReadyToEdit(state).length > 0;
+    const moreRead = listFilesPendingRead(state, state.goal).length > 0;
+    if (!moreEdit && !moreRead) {
+      return;
+    }
   }
 
   const readLoop = state.consecutiveReadIterations >= MAX_CONSECUTIVE_READ_ITERATIONS;
@@ -53,15 +64,215 @@ export function filterToolsForPhase(
   tools: ToolDefinition[],
   phase: ExecutionPhase,
   intent: MessageIntent,
-  toolsMode: string
+  toolsMode: string,
+  state?: TaskState
 ): ToolDefinition[] {
   if (toolsMode !== 'agent' || intent !== 'project_write' || phase === 'explore') {
     return tools;
   }
 
+  if (state && shouldUseEditOnlyTools(state, state.goal)) {
+    return tools.filter((tool) => IMPLEMENT_TOOL_NAMES.has(tool.name));
+  }
+
   return tools.filter(
     (tool) => IMPLEMENT_TOOL_NAMES.has(tool.name) || IMPLEMENT_PHASE_READ_TOOLS.has(tool.name)
   );
+}
+
+/** Leitura concluída nos arquivos tocados — só edit_file + test_project até editar */
+export function shouldUseEditOnlyTools(state: TaskState, userPrompt: string): boolean {
+  const ready = listFilesReadyToEdit(state);
+  if (ready.length === 0) {
+    return false;
+  }
+  const pendingRead = listFilesPendingRead(state, userPrompt);
+  return pendingRead.length === 0;
+}
+
+export function buildConcreteEditHint(filePath: string, goal: string): string {
+  const lower = filePath.toLowerCase();
+  const uiGoal = /bonito|beleza|layout|front-?end|visual|design|moderniz|ui/i.test(goal);
+  if (lower.includes('panelhtml') && uiGoal) {
+    return [
+      'Sugestão concreta (panelHtml.ts):',
+      '- edit_file replace_lines start_line=10 end_line=30 — body, font, cores base',
+      '- edit_file replace_lines start_line=90 end_line=180 — .chat-container, .message, input, botões',
+      '- Variáveis VS Code: var(--vscode-*) — padding, gap, border-radius, box-shadow',
+    ].join('\n');
+  }
+  if (uiGoal && lower.includes('chatview')) {
+    return 'Sugestão: edit_file replace_lines nos trechos de UI já lidos neste arquivo.';
+  }
+  return 'Use edit_file replace_lines com start_line/end_line/content dos trechos N| já lidos.';
+}
+
+export function buildMandatoryEditMessage(state: TaskState, userPrompt: string): string {
+  const next = pickPrimaryEditTarget(state, userPrompt);
+  const ready = listFilesReadyToEdit(state);
+  return [
+    '[MODO EDITOR — leitura encerrada, implementação obrigatória]',
+    `Pedido do usuário: ${state.goal || userPrompt}`,
+    next ? `Próximo edit_file: \`${next}\`` : '',
+    ready.length > 1 ? `Arquivos aguardando edição: ${ready.join(', ')}` : '',
+    buildConcreteEditHint(next ?? '', state.goal || userPrompt),
+    '',
+    'read_file e search_files estão DESATIVADOS até salvar alterações.',
+    'Chame edit_file replace_lines AGORA. Depois test_project.',
+  ].filter(Boolean).join('\n');
+}
+
+/** Ainda há leitura ou edição pendente neste pedido (multi-arquivo) */
+export function needsMoreFileWork(
+  state: TaskState,
+  userPrompt: string,
+  sessionChanges: FileChange[]
+): boolean {
+  const changed = new Set(sessionChanges.map((c) => c.file));
+  const pendingEdit = listFilesReadyToEdit(state).filter((f) => !changed.has(f));
+  if (pendingEdit.length > 0) {
+    return true;
+  }
+  if (listFilesPendingRead(state, userPrompt).length > 0) {
+    return true;
+  }
+  return false;
+}
+
+export function buildMultiFileEditContinueMessage(state: TaskState, userPrompt: string): string {
+  const pending = listFilesReadyToEdit(state);
+  const pendingRead = listFilesPendingRead(state, userPrompt);
+  const changed = state.filesChanged;
+  return [
+    '[Continuar — pedido pode envolver vários arquivos]',
+    changed.length > 0 ? `Já alterados: ${changed.join(', ')}` : '',
+    pending.length > 0 ? `Próximos edit_file: ${pending.join(', ')}` : '',
+    pendingRead.length > 0 ? `Ainda ler (se precisar): ${pendingRead.join(', ')}` : '',
+    'Edite cada arquivo relevante com edit_file replace_lines. Depois test_project.',
+  ].filter(Boolean).join('\n');
+}
+
+/** Arquivos citados no pedido ou já tocados que ainda não foram lidos por completo */
+export function listFilesPendingRead(state: TaskState, userPrompt: string): string[] {
+  const candidates = new Set<string>([
+    ...extractFilenamesFromPrompt(userPrompt).map((f) => f.replace(/\\/g, '/')),
+    ...state.filesRead,
+  ]);
+  return [...candidates].filter((file) => !isFileFullyRead(state.fileReadCoverage, file));
+}
+
+/** Arquivos já lidos por completo nesta sessão, ainda sem edit_file */
+export function listFilesReadyToEdit(state: TaskState): string[] {
+  const changed = new Set(state.filesChanged);
+  return [...state.filesRead].filter(
+    (file) => isFileFullyRead(state.fileReadCoverage, file) && !changed.has(file)
+  );
+}
+
+export function buildForceEditAfterReadMessage(state: TaskState, target: string): string {
+  const entry = getCoverageEntry(state.fileReadCoverage, target);
+  const pending = listFilesPendingRead(state, state.goal);
+  const ready = listFilesReadyToEdit(state);
+  const isPanelHtml = target.toLowerCase().includes('panelhtml');
+  return [
+    `[Arquivo \`${target}\` lido por completo (${entry?.totalLines ?? '?'} linhas)]`,
+    isPanelHtml
+      ? 'CSS/layout: bloco <style> em getPanelHtml() (~linhas 8–400). Use edit_file replace_lines.'
+      : 'Use edit_file replace_lines com números N| do read_file.',
+    ready.length > 1
+      ? `Prontos para editar (já lidos): ${ready.join(', ')}`
+      : '',
+    pending.length > 0
+      ? `Ainda pode ler outros arquivos: ${pending.join(', ')}`
+      : 'Todos os arquivos tocados já foram lidos — edite cada um que precisar alterar.',
+    'Não reler este arquivo inteiro; reverificação estreita (≤30 linhas) se necessário.',
+  ].filter(Boolean).join('\n');
+}
+
+export function buildImplementProgressMessage(state: TaskState, userPrompt: string): string {
+  const pending = listFilesPendingRead(state, userPrompt);
+  const ready = listFilesReadyToEdit(state);
+  const reads = [...state.filesRead];
+
+  if (ready.length > 0 && pending.length === 0) {
+    return [
+      '[Implementação — todos os arquivos lidos]',
+      `Pedido: ${state.goal || userPrompt}`,
+      `Edite com edit_file: ${ready.join(', ')}`,
+      'Depois test_project se aplicável.',
+    ].join('\n');
+  }
+
+  if (ready.length > 0 && pending.length > 0) {
+    return [
+      '[Implementação — múltiplos arquivos]',
+      `Pedido: ${state.goal || userPrompt}`,
+      `Já lidos (edite quando quiser): ${ready.join(', ')}`,
+      `Ainda faltam ler: ${pending.join(', ')}`,
+      'Pode alternar: edit_file nos lidos OU read_file nos pendentes.',
+    ].join('\n');
+  }
+
+  return buildImplementPhaseMessage(state, userPrompt);
+}
+
+/** Preenche e ajusta start_line/end_line na fase implementação (arquivo alvo) */
+export function coerceImplementPhaseRead(
+  args: Record<string, unknown>,
+  state: TaskState,
+  phase: ExecutionPhase
+): Record<string, unknown> {
+  if (phase !== 'implement') {
+    return args;
+  }
+
+  const filePath = typeof args.path === 'string' ? args.path : undefined;
+  if (!filePath) {
+    return args;
+  }
+
+  const entry = getCoverageEntry(state.fileReadCoverage, filePath);
+  const totalLines = entry?.totalLines;
+  const continueRead = args.continue_read === true || args.continue_read === 'true';
+
+  let start = asLineNumber(args.start_line);
+  let end = asLineNumber(args.end_line);
+
+  if (continueRead || (start === undefined && end === undefined)) {
+    const nextRange = getNextUnreadRange(state.fileReadCoverage, filePath, MAX_IMPLEMENT_READ_SPAN);
+    if (nextRange) {
+      start = nextRange.start;
+      end = nextRange.end;
+    }
+  }
+
+  if (start !== undefined && end === undefined) {
+    end = totalLines
+      ? Math.min(start + MAX_IMPLEMENT_READ_SPAN - 1, totalLines)
+      : start + MAX_IMPLEMENT_READ_SPAN - 1;
+  }
+
+  if (start !== undefined && end !== undefined) {
+    if (end < start) {
+      end = start;
+    }
+    const maxEnd = start + MAX_IMPLEMENT_READ_SPAN - 1;
+    if (end - start + 1 > MAX_IMPLEMENT_READ_SPAN) {
+      end = totalLines ? Math.min(maxEnd, totalLines) : maxEnd;
+    }
+    if (totalLines && end > totalLines) {
+      end = totalLines;
+    }
+    return { ...args, start_line: start, end_line: end, continue_read: false };
+  }
+
+  return args;
+}
+
+function pathsMatch(a: string, b: string): boolean {
+  const na = a.replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase();
+  const nb = b.replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase();
+  return na === nb || na.endsWith(`/${nb}`) || nb.endsWith(`/${na}`);
 }
 
 export function getToolBlockReason(
@@ -88,23 +299,37 @@ export function getToolBlockReason(
   }
 
   if (state.phase === 'implement' && READ_TOOL_NAMES.has(toolName)) {
+    if (toolName === 'list_files') {
+      return 'list_files bloqueado na implementação — use read_file no arquivo alvo ou edit_file.';
+    }
+
+    const target = pickPrimaryEditTarget(state, state.goal);
+
+    if (toolName === 'read_file' && filePath && isFileFullyRead(state.fileReadCoverage, filePath)) {
+      if (!isNarrowVerificationRead(args)) {
+        const pending = listFilesPendingRead(state, state.goal);
+        return [
+          `read_file bloqueado para \`${filePath}\` — já lido por completo nesta sessão.`,
+          'Edite com edit_file replace_lines (releitura estreita ≤30 linhas ainda permitida).',
+          pending.length > 0 ? `Outros arquivos pendentes: ${pending.join(', ')}` : '',
+        ].filter(Boolean).join(' ');
+      }
+    }
+
     if (isAllowedReadInImplement(toolName, args, filePath, state)) {
       return null;
     }
 
-    const target = pickPrimaryEditTarget(state, state.goal);
-    const cov = filePath ? state.fileReadCoverage[filePath] : undefined;
-    const covText = cov
+    const cov = filePath ? getCoverageEntry(state.fileReadCoverage, filePath) : undefined;
+    const covText = cov && filePath
       ? `${filePath}: ${Math.max(...cov.ranges.map((r) => r.to), 0)}/${cov.totalLines} linhas`
       : [...state.filesRead].join(', ') || '(nenhum)';
-    const hints = buildImplementReadHints(target, filePath, state);
 
     return [
       'Leitura bloqueada — fase de IMPLEMENTAÇÃO.',
-      `Contexto já carregado: ${covText}.`,
-      'Permitido: search_files; read_file com start_line+end_line (≤30 reverificar, ≤350 trecho novo); continue_read no arquivo alvo.',
-      ...hints,
-      target ? `Arquivo alvo: ${target}` : '',
+      `Contexto: ${covText}.`,
+      formatReadArgsSummary(args) ? `Parâmetros: ${formatReadArgsSummary(args)}` : '',
+      target ? `Leia só o arquivo alvo: ${target}` : '',
     ].filter(Boolean).join(' ');
   }
 
@@ -125,61 +350,28 @@ function isAllowedReadInImplement(
     return false;
   }
 
-  if (isNarrowVerificationRead(args)) {
+  if (!isFileFullyRead(state.fileReadCoverage, filePath)) {
     return true;
   }
 
-  const target = pickPrimaryEditTarget(state, state.goal);
-  const isTargetFile = !target || filePath === target || filePath.endsWith(target);
-
-  const continueRead = args.continue_read === true || args.continue_read === 'true';
-  if (continueRead && isTargetFile) {
-    const cov = state.fileReadCoverage[filePath];
-    if (cov && !isFileFullyRead(state.fileReadCoverage, filePath)) {
-      return true;
-    }
-  }
-
-  const start = asLineNumber(args.start_line);
-  const end = asLineNumber(args.end_line);
-  if (start === undefined || end === undefined || start < 1 || end < start) {
-    return false;
-  }
-
-  const span = end - start + 1;
-  if (span > MAX_IMPLEMENT_READ_SPAN) {
-    return false;
-  }
-
-  if (!isRangeFullyRead(state.fileReadCoverage, filePath, start, end)) {
-    return isTargetFile;
-  }
-
-  return span <= MAX_VERIFY_READ_SPAN;
+  return isNarrowVerificationRead(args);
 }
 
-function buildImplementReadHints(
-  target: string | null,
-  filePath: string | undefined,
-  state: TaskState
-): string[] {
-  const hints: string[] = [
-    'Fluxo: search_files → read_file start_line/end_line → edit_file replace_lines.',
-  ];
-
-  const path = filePath ?? target;
-  if (!path) {
-    return hints;
+function formatReadArgsSummary(args: Record<string, unknown>): string {
+  const parts: string[] = [];
+  if (typeof args.path === 'string') {
+    parts.push(`path="${args.path}"`);
   }
-
-  const cov = state.fileReadCoverage[path];
-  if (cov && !isFileFullyRead(state.fileReadCoverage, path)) {
-    const next = Math.max(...cov.ranges.map((r) => r.to), 0) + 1;
-    const end = Math.min(cov.totalLines, next + MAX_IMPLEMENT_READ_SPAN - 1);
-    hints.push(`Próximo trecho não lido: read_file path="${path}" start_line=${next} end_line=${end}`);
+  if (args.start_line !== undefined) {
+    parts.push(`start_line=${args.start_line}`);
   }
-
-  return hints;
+  if (args.end_line !== undefined) {
+    parts.push(`end_line=${args.end_line}`);
+  }
+  if (args.continue_read !== undefined) {
+    parts.push(`continue_read=${args.continue_read}`);
+  }
+  return parts.join(' ');
 }
 
 function isNarrowVerificationRead(args: Record<string, unknown>): boolean {
@@ -228,6 +420,16 @@ export function buildEditRecoveryHint(args: Record<string, unknown>, errorOutput
 }
 
 export function pickPrimaryEditTarget(state: TaskState, userPrompt: string): string | null {
+  const ready = listFilesReadyToEdit(state);
+  if (ready.length > 0) {
+    return ready[0];
+  }
+
+  const pending = listFilesPendingRead(state, userPrompt);
+  if (pending.length > 0) {
+    return pending[0];
+  }
+
   const fromPrompt = extractFilenamesFromPrompt(userPrompt);
   if (fromPrompt.length > 0) {
     return fromPrompt[0].replace(/\\/g, '/');
@@ -254,16 +456,17 @@ export function pickPrimaryEditTarget(state: TaskState, userPrompt: string): str
 }
 
 export function buildImplementPhaseMessage(state: TaskState, userPrompt: string): string {
-  const target = pickPrimaryEditTarget(state, userPrompt);
   const reads = [...state.filesRead];
+  const pending = listFilesPendingRead(state, userPrompt);
+  const ready = listFilesReadyToEdit(state);
 
   return [
     '[Implementação obrigatória — o usuário pediu alteração no código]',
     `Pedido: ${state.goal}`,
-    reads.length > 0 ? `Contexto já lido: ${reads.join(', ')}` : '',
-    target ? `Edite: \`${target}\` com edit_file replace_lines (números do read_file).` : 'Edite com edit_file replace_lines.',
-    '',
-    'Se não souber a linha: search_files → read_file start_line/end_line (≤350) → edit_file.',
+    reads.length > 0 ? `Arquivos já tocados: ${reads.join(', ')}` : '',
+    ready.length > 0 ? `Prontos para edit_file: ${ready.join(', ')}` : '',
+    pending.length > 0 ? `Ainda ler (se necessário): ${pending.join(', ')}` : '',
+    'Use edit_file replace_lines nos arquivos lidos; read_file em arquivos novos ou trechos pendentes.',
     'Não responda só com instruções manuais.',
   ].filter(Boolean).join('\n');
 }
@@ -274,13 +477,19 @@ export function buildPhaseContextBlock(state: TaskState, toolsMode: string): str
   }
 
   if (state.phase === 'implement') {
-    const target = pickPrimaryEditTarget(state, state.goal);
+    const pending = listFilesPendingRead(state, state.goal);
+    const ready = listFilesReadyToEdit(state);
+    const editOnly = shouldUseEditOnlyTools(state, state.goal);
     return [
       '',
       '## Implementação pendente (usuário pediu alteração)',
-      target ? `Próximo passo: edit_file replace_lines em \`${target}\`` : 'Próximo passo: edit_file replace_lines (por número de linha)',
-      'Leitura limitada: search_files + read_file por trecho (não leia o arquivo inteiro).',
-    ].join('\n');
+      editOnly
+        ? `MODO EDITOR: edit_file em ${ready.join(', ') || 'arquivo lido'} — leitura desativada`
+        : ready.length > 0 ? `Editar (já lidos): ${ready.join(', ')}` : 'Próximo passo: edit_file replace_lines',
+      pending.length > 0 ? `Ler se faltar contexto: ${pending.join(', ')}` : '',
+      editOnly && ready[0] ? buildConcreteEditHint(ready[0], state.goal) : '',
+      'Vários arquivos: edite cada um lido. O pedido só termina após alterações reais.',
+    ].filter(Boolean).join('\n');
   }
 
   return [
