@@ -3,12 +3,18 @@ import { ToolDefinition } from './types';
 import { MessageIntent } from './messageIntent';
 import type { TaskState } from './taskTracker';
 import { extractFilenamesFromPrompt } from './taskCompletion';
+import { isFileFullyRead, isRangeFullyRead } from '../tools/fileReadChunks';
 
 export type ExecutionPhase = 'explore' | 'implement';
 
+const IMPLEMENT_PHASE_READ_TOOLS = new Set(['read_file', 'search_files']);
 const READ_TOOL_NAMES = new Set(['read_file', 'list_files', 'search_files']);
 const WRITE_TOOL_NAMES = new Set<string>(WRITE_TOOLS);
 const IMPLEMENT_TOOL_NAMES = new Set<string>(IMPLEMENT_TOOLS);
+
+/** Máximo de linhas por leitura na fase implementação (trecho novo ou reverificação) */
+const MAX_IMPLEMENT_READ_SPAN = 350;
+const MAX_VERIFY_READ_SPAN = 30;
 
 /** Leituras totais (inclui chunks) antes de forçar implementação */
 const MAX_TOTAL_READS = 20;
@@ -53,7 +59,9 @@ export function filterToolsForPhase(
     return tools;
   }
 
-  return tools.filter((tool) => IMPLEMENT_TOOL_NAMES.has(tool.name));
+  return tools.filter(
+    (tool) => IMPLEMENT_TOOL_NAMES.has(tool.name) || IMPLEMENT_PHASE_READ_TOOLS.has(tool.name)
+  );
 }
 
 export function getToolBlockReason(
@@ -80,23 +88,98 @@ export function getToolBlockReason(
   }
 
   if (state.phase === 'implement' && READ_TOOL_NAMES.has(toolName)) {
-    if (toolName === 'read_file' && isNarrowVerificationRead(args)) {
+    if (isAllowedReadInImplement(toolName, args, filePath, state)) {
       return null;
     }
+
     const target = pickPrimaryEditTarget(state, state.goal);
     const cov = filePath ? state.fileReadCoverage[filePath] : undefined;
     const covText = cov
       ? `${filePath}: ${Math.max(...cov.ranges.map((r) => r.to), 0)}/${cov.totalLines} linhas`
       : [...state.filesRead].join(', ') || '(nenhum)';
+    const hints = buildImplementReadHints(target, filePath, state);
+
     return [
       'Leitura bloqueada — fase de IMPLEMENTAÇÃO.',
       `Contexto já carregado: ${covText}.`,
-      'Use edit_file replace_lines ou read_file estreito (≤30 linhas) para reverificar.',
-      target ? `Sugestão: ${target}` : '',
+      'Permitido: search_files; read_file com start_line+end_line (≤30 reverificar, ≤350 trecho novo); continue_read no arquivo alvo.',
+      ...hints,
+      target ? `Arquivo alvo: ${target}` : '',
     ].filter(Boolean).join(' ');
   }
 
   return null;
+}
+
+function isAllowedReadInImplement(
+  toolName: string,
+  args: Record<string, unknown>,
+  filePath: string | undefined,
+  state: TaskState
+): boolean {
+  if (toolName === 'search_files') {
+    return true;
+  }
+
+  if (toolName !== 'read_file' || !filePath) {
+    return false;
+  }
+
+  if (isNarrowVerificationRead(args)) {
+    return true;
+  }
+
+  const target = pickPrimaryEditTarget(state, state.goal);
+  const isTargetFile = !target || filePath === target || filePath.endsWith(target);
+
+  const continueRead = args.continue_read === true || args.continue_read === 'true';
+  if (continueRead && isTargetFile) {
+    const cov = state.fileReadCoverage[filePath];
+    if (cov && !isFileFullyRead(state.fileReadCoverage, filePath)) {
+      return true;
+    }
+  }
+
+  const start = asLineNumber(args.start_line);
+  const end = asLineNumber(args.end_line);
+  if (start === undefined || end === undefined || start < 1 || end < start) {
+    return false;
+  }
+
+  const span = end - start + 1;
+  if (span > MAX_IMPLEMENT_READ_SPAN) {
+    return false;
+  }
+
+  if (!isRangeFullyRead(state.fileReadCoverage, filePath, start, end)) {
+    return isTargetFile;
+  }
+
+  return span <= MAX_VERIFY_READ_SPAN;
+}
+
+function buildImplementReadHints(
+  target: string | null,
+  filePath: string | undefined,
+  state: TaskState
+): string[] {
+  const hints: string[] = [
+    'Fluxo: search_files → read_file start_line/end_line → edit_file replace_lines.',
+  ];
+
+  const path = filePath ?? target;
+  if (!path) {
+    return hints;
+  }
+
+  const cov = state.fileReadCoverage[path];
+  if (cov && !isFileFullyRead(state.fileReadCoverage, path)) {
+    const next = Math.max(...cov.ranges.map((r) => r.to), 0) + 1;
+    const end = Math.min(cov.totalLines, next + MAX_IMPLEMENT_READ_SPAN - 1);
+    hints.push(`Próximo trecho não lido: read_file path="${path}" start_line=${next} end_line=${end}`);
+  }
+
+  return hints;
 }
 
 function isNarrowVerificationRead(args: Record<string, unknown>): boolean {
@@ -105,7 +188,7 @@ function isNarrowVerificationRead(args: Record<string, unknown>): boolean {
   if (start === undefined || end === undefined || start < 1 || end < start) {
     return false;
   }
-  return end - start + 1 <= 30;
+  return end - start + 1 <= MAX_VERIFY_READ_SPAN;
 }
 
 function asLineNumber(value: unknown): number | undefined {
@@ -178,10 +261,10 @@ export function buildImplementPhaseMessage(state: TaskState, userPrompt: string)
     '[Implementação obrigatória — o usuário pediu alteração no código]',
     `Pedido: ${state.goal}`,
     reads.length > 0 ? `Contexto já lido: ${reads.join(', ')}` : '',
-    target ? `Edite agora: \`${target}\` com edit_file replace_lines` : 'Edite com edit_file replace_lines (números do read_file).',
+    target ? `Edite: \`${target}\` com edit_file replace_lines (números do read_file).` : 'Edite com edit_file replace_lines.',
     '',
+    'Se não souber a linha: search_files → read_file start_line/end_line (≤350) → edit_file.',
     'Não responda só com instruções manuais.',
-    'Não leia mais arquivos — aplique a alteração com ferramenta.',
   ].filter(Boolean).join('\n');
 }
 
@@ -196,14 +279,14 @@ export function buildPhaseContextBlock(state: TaskState, toolsMode: string): str
       '',
       '## Implementação pendente (usuário pediu alteração)',
       target ? `Próximo passo: edit_file replace_lines em \`${target}\`` : 'Próximo passo: edit_file replace_lines (por número de linha)',
-      'Leitura bloqueada até salvar alterações.',
+      'Leitura limitada: search_files + read_file por trecho (não leia o arquivo inteiro).',
     ].join('\n');
   }
 
   return [
     '',
     '## Exploração (leitura particionada — estilo Cursor)',
-    'Arquivos grandes vêm em blocos de ~100 linhas.',
+    'Arquivos grandes vêm em blocos de ~350 linhas.',
     'Use read_file → continue_read=true ou start_line=N para o próximo trecho.',
     'Leia só o necessário; depois edit_file + test_project.',
   ].join('\n');

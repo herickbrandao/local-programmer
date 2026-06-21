@@ -12,7 +12,7 @@ export interface SystemPromptOptions {
 const ALL_TOOLS: ToolDefinition[] = [
   {
     name: 'read_file',
-    description: 'Lê arquivo em trechos (~100 linhas). Arquivos grandes vêm particionados automaticamente.',
+    description: 'Lê arquivo em trechos (~350 linhas). Arquivos grandes vêm particionados automaticamente.',
     parameters: {
       type: 'object',
       properties: {
@@ -20,7 +20,7 @@ const ALL_TOOLS: ToolDefinition[] = [
         start_line: { type: 'number', description: 'Linha inicial (1-based). Para trecho específico ou busca por linha.' },
         end_line: { type: 'number', description: 'Linha final inclusive (opcional)' },
         continue_read: { type: 'boolean', description: 'true = próximo bloco após o último lido deste arquivo' },
-        chunk_size: { type: 'number', description: 'Tamanho do bloco em linhas (padrão 100)' },
+        chunk_size: { type: 'number', description: 'Tamanho do bloco em linhas (padrão 350)' },
       },
       required: ['path'],
     },
@@ -240,10 +240,11 @@ ${contextSection}${taskSection}`;
     const phaseBlock = phase === 'implement'
       ? `
 ## FASE ATUAL: IMPLEMENTAÇÃO
-- Leitura ENCERRADA — NÃO use read_file, list_files ou search_files
-- Use **edit_file** (alteração cirúrgica) — NUNCA reescreva o arquivo inteiro
-- Depois de editar, chame **test_project** para validar
-- NÃO diga ao usuário para aplicar manualmente`
+- Leitura ampla ENCERRADA — não use read_file sem start_line/end_line
+- **search_files** permitido para achar linha (ex: nome de função ou classe CSS)
+- **read_file** permitido: trecho ≤350 linhas não lido OU ≤30 linhas para reverificar
+- Use **edit_file replace_lines** — NUNCA reescreva o arquivo inteiro
+- Depois de editar, chame **test_project** para validar`
       : `
 ## Fase: EXPLORAÇÃO
 - Leia trechos com read_file (use start_line/end_line em arquivos grandes)
@@ -256,7 +257,7 @@ ${contextSection}${taskSection}`;
 Resolver o pedido do usuário com **edições cirúrgicas** — preservar o código existente.
 
 ## Fluxo recomendado (estilo Cursor/Codex)
-1. **read_file** — primeiro bloco (automático ~100 linhas se grande)
+1. **read_file** — primeiro bloco (automático ~350 linhas se grande)
 2. **continue_read=true** ou **start_line=N** — próximos trechos só se precisar
 3. **edit_file** — alteração cirúrgica no trecho relevante
 4. **test_project** — compile/test
