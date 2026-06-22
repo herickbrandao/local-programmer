@@ -58,6 +58,7 @@ import { SnapshotManager } from '../history/snapshotManager';
 import { DiffManager } from '../editor/diffManager';
 import { ContextManager } from '../workspace/contextManager';
 import { attemptForcedEdit, buildEditSuccessMessage } from './editorFallback';
+import { runPlanDrivenPipeline, PlanRunnerResult } from './planDrivenRunner';
 
 export class AgentController {
   private promptManager = new PromptManager();
@@ -263,10 +264,43 @@ export class AgentController {
         validationAttempts = 0;
         forceTextOnly = false;
         partialResponses.length = 0;
+        taskState.planPipelineDone = false;
 
         const subtaskMaxIterations = decomposition.decomposed
           ? Math.max(3, Math.ceil(maxIterations / subtaskCount))
           : maxIterations;
+
+        const subtaskGoal = decomposition.decomposed
+          ? decomposition.subtasks[subIdx]
+          : userPrompt;
+
+        let skipAgentLoopForSubtask = false;
+
+        if (resolved.toolsMode === 'agent' && effectiveIntent === 'project_write') {
+          const planResult = await this.runPlanDrivenPipeline(
+            provider,
+            model,
+            subtaskGoal,
+            taskState,
+            projectContext ?? '',
+            pendingChanges,
+            sessionChanges
+          );
+          taskState.planPipelineDone = true;
+          skipAgentLoopForSubtask = this.handlePlanPipelineResult(
+            planResult,
+            taskState,
+            decomposition.decomposed,
+            completedSubtaskNotes
+          );
+          if (skipAgentLoopForSubtask && !decomposition.decomposed) {
+            stoppedEarly = true;
+          }
+        }
+
+        if (skipAgentLoopForSubtask) {
+          continue;
+        }
 
         for (let i = 0; i < subtaskMaxIterations; i++) {
         taskState.iteration = i + 1;
@@ -968,6 +1002,69 @@ export class AgentController {
       'Só conversar'
     );
     return choice === 'Permitir alteração';
+  }
+
+  /** Pipeline: análise → plano N edições → verificação → compile */
+  private async runPlanDrivenPipeline(
+    provider: AIProvider,
+    model: string,
+    goal: string,
+    taskState: TaskState,
+    projectContext: string,
+    pendingChanges: PendingChange[],
+    sessionChanges: FileChange[]
+  ): Promise<PlanRunnerResult> {
+    return runPlanDrivenPipeline(goal, taskState, projectContext, pendingChanges, sessionChanges, {
+      provider,
+      model,
+      workspaceRoot: this.workspaceRoot,
+      contextManager: this.contextManager,
+      emitThinking: (content) => this.emit({ type: 'thinking', content }),
+      emitMessage: (content) => {
+        this.messages.push({ role: 'assistant', content });
+        this.emit({ type: 'message', content, data: { role: 'assistant' } });
+      },
+      executeEdit: (args, state, pending, changes) =>
+        this.executeToolWithPermission('edit_file', args, pending, changes, state),
+      runCompileCheck: async () => {
+        const tool = this.toolRegistry.get('test_project');
+        if (!tool) {
+          return { ok: true, output: '' };
+        }
+        const result = await tool.execute({}, { workspaceRoot: this.workspaceRoot });
+        return { ok: result.success, output: result.output };
+      },
+    });
+  }
+
+  /** Retorna true se o loop agente padrão pode ser pulado para este subtask */
+  private handlePlanPipelineResult(
+    result: PlanRunnerResult,
+    taskState: TaskState,
+    decomposed: boolean,
+    completedSubtaskNotes: string[]
+  ): boolean {
+    if (!result.handled) {
+      return false;
+    }
+
+    if (result.changesCount > 0) {
+      taskState.filesChanged = [...new Set([
+        ...taskState.filesChanged,
+        ...(result.plan?.items.filter((i) => i.status === 'done').map((i) => i.path) ?? []),
+      ])];
+    }
+
+    if (result.changesCount === 0) {
+      return false;
+    }
+
+    if (decomposed) {
+      completedSubtaskNotes.push(result.message.slice(0, 600));
+      return true;
+    }
+
+    return result.success;
   }
 
   private stopAgentLoop(message: string): void {

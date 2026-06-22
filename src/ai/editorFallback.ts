@@ -44,6 +44,10 @@ function inferFallbackTarget(taskState: TaskState, userPrompt: string): string |
     return fromPrompt[0];
   }
 
+  if (/documenta|readme|docs?|manual|ollama/i.test(goal)) {
+    return 'README.md';
+  }
+
   if (/front|bonito|ui|painel|visual|layout|css|embelez/i.test(goal)) {
     return 'src/ui/panelHtml.ts';
   }

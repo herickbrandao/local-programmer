@@ -3,6 +3,10 @@ import { MessageIntent } from './messageIntent';
 import { TaskPlan } from './taskDecomposer';
 import { ExecutionPhase, buildImplementPhaseMessage, createInitialPhase, needsMoreFileWork, listFilesReadyToEdit } from './executionPhase';
 import { FileReadCoverageMap, formatCoverageSummary } from '../tools/fileReadChunks';
+import type { EditPlan } from './editPlanPipeline';
+import { buildPlanContextBlock } from './editPlanPipeline';
+
+export type PlanPhase = 'idle' | 'planning' | 'executing' | 'verifying' | 'complete' | 'complete_with_warnings' | 'failed';
 
 export interface TaskState {
   goal: string;
@@ -20,6 +24,11 @@ export interface TaskState {
   fileReadCoverage: FileReadCoverageMap;
   /** Evita repetir aviso de modo editor na mesma sessão */
   editorModeAnnounced?: boolean;
+  /** Plano estruturado de edições (análise → N alterações → verificação) */
+  editPlan?: EditPlan;
+  planPhase?: PlanPhase;
+  /** Plano em etapas já executado neste subtask — evita repetir */
+  planPipelineDone?: boolean;
 }
 
 export function createTaskState(goal: string, intent: MessageIntent): TaskState {
@@ -59,6 +68,11 @@ export function buildTaskContextBlock(state: TaskState, phaseContext = ''): stri
       lines.push(`Etapas concluídas: ${plan.completedNotes.length}/${plan.subtasks.length}`);
     }
     lines.push('Após todas as etapas, integre o resultado final de forma coesa.');
+  }
+
+  const planBlock = buildPlanContextBlock(state.editPlan);
+  if (planBlock) {
+    lines.push(planBlock);
   }
 
   if (read.length > 0) {

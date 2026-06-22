@@ -76,6 +76,8 @@ export class ContextManager {
       .map((f) => f.path)
       .slice(0, 30);
 
+    const codeIndex = await this.loadCodeIndex();
+
     return [
       `Raiz: ${map.root}`,
       `Arquivos: ${map.totalFiles}`,
@@ -86,7 +88,44 @@ export class ContextManager {
       '',
       'Arquivos importantes:',
       importantFiles.join('\n'),
+      codeIndex ? `\nSímbolos (resumo):\n${codeIndex}` : '',
     ].join('\n');
+  }
+
+  async getCodeIndexSummary(workspaceRoot: string): Promise<string> {
+    await this.getProjectContext(workspaceRoot);
+    return this.loadCodeIndex();
+  }
+
+  private async loadCodeIndex(): Promise<string> {
+    try {
+      const content = await fs.readFile(
+        path.join(this.contextDir, 'code-index.json'),
+        'utf-8'
+      );
+      const index = JSON.parse(content) as CodeIndexEntry[];
+      if (!Array.isArray(index) || index.length === 0) {
+        return '';
+      }
+      return index
+        .slice(0, 40)
+        .map((e) => {
+          const parts: string[] = [e.path];
+          if (e.exports.length > 0) {
+            parts.push(`exports: ${e.exports.slice(0, 8).join(', ')}`);
+          }
+          if (e.functions.length > 0) {
+            parts.push(`fn: ${e.functions.slice(0, 6).join(', ')}`);
+          }
+          if (e.classes.length > 0) {
+            parts.push(`class: ${e.classes.slice(0, 4).join(', ')}`);
+          }
+          return `- ${parts.join(' | ')}`;
+        })
+        .join('\n');
+    } catch {
+      return '';
+    }
   }
 
   private isImportantFile(filePath: string): boolean {
