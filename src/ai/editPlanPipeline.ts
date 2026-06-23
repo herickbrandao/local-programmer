@@ -4,6 +4,13 @@ import { extractFilenamesFromPrompt } from './taskCompletion';
 import { extractToolCallsFromContent, toToolCalls } from './toolCallParser';
 import { formatNumberedLines } from '../tools/fileReadChunks';
 import { resolveWorkspacePath } from '../tools/pathUtils';
+import {
+  clampEditToCitation,
+  findCitationForFile,
+  formatCitationConstraint,
+  parseLineCitations,
+  type FileLineCitation,
+} from './lineCitations';
 
 export type EditPlanItemStatus = 'pending' | 'done' | 'failed' | 'skipped';
 
@@ -48,9 +55,7 @@ const MAX_SNIPPET_LINES = 60;
 
 export function inferTargetFiles(goal: string, projectContext?: string): string[] {
   const fromPrompt = extractFilenamesFromPrompt(goal);
-  const cited = [...goal.matchAll(/@([^\s@:]+)(?::(\d+)(?:-(\d+))?)?/g)].map((m) =>
-    m[1].replace(/\\/g, '/')
-  );
+  const cited = parseLineCitations(goal).map((c) => c.path);
 
   const files = [...new Set([...fromPrompt, ...cited].map((f) => f.replace(/\\/g, '/')))];
   if (files.length > 0) {
@@ -119,11 +124,13 @@ export async function discoverTargetFiles(
 export async function loadFileSnippets(
   workspaceRoot: string,
   goal: string,
-  extraFiles: string[] = []
+  extraFiles: string[] = [],
+  citedRanges?: FileLineCitation[]
 ): Promise<FileSnippet[]> {
   const discovered = await discoverTargetFiles(workspaceRoot, goal);
   const files = [...new Set([...discovered, ...extraFiles])];
   const snippets: FileSnippet[] = [];
+  const allCitations = citedRanges?.length ? citedRanges : parseLineCitations(goal);
 
   for (const file of files) {
     const fullPath = resolveWorkspacePath(workspaceRoot, file);
@@ -137,31 +144,35 @@ export async function loadFileSnippets(
     const lines = content.split('\n');
     const total = lines.length;
 
-    const citeMatch = [...goal.matchAll(/@([^\s@:]+):(\d+)(?:-(\d+))?/g)].find(
-      (m) => m[1].replace(/\\/g, '/') === file || file.endsWith(m[1])
-    );
+    const citeMatch = findCitationForFile(allCitations, file)
+      ?? allCitations.find((c) => file.endsWith(c.path.split('/').pop() ?? ''));
 
     let from = 1;
     let to = Math.min(MAX_SNIPPET_LINES, total);
 
     if (citeMatch) {
-      const start = parseInt(citeMatch[2], 10);
-      const end = citeMatch[3] ? parseInt(citeMatch[3], 10) : start;
-      from = Math.max(1, start - CONTEXT_PADDING);
-      to = Math.min(total, end + CONTEXT_PADDING);
-      if (to - from > MAX_SNIPPET_LINES) {
-        to = from + MAX_SNIPPET_LINES - 1;
+      from = citeMatch.startLine;
+      to = citeMatch.endLine;
+    } else {
+      const atMatch = [...goal.matchAll(/@([^\s@:]+):(\d+)(?:-(\d+))?/g)].find(
+        (m) => m[1].replace(/\\/g, '/') === file || file.endsWith(m[1])
+      );
+      if (atMatch) {
+        const start = parseInt(atMatch[2], 10);
+        const end = atMatch[3] ? parseInt(atMatch[3], 10) : start;
+        from = Math.max(1, start - CONTEXT_PADDING);
+        to = Math.min(total, end + CONTEXT_PADDING);
+      } else if (/ollama|pull|serve/i.test(goal) && /\.md$/i.test(file)) {
+        const anchor = lines.findIndex((l) => /ollama/i.test(l));
+        if (anchor >= 0) {
+          from = Math.max(1, anchor - 4);
+          to = Math.min(total, anchor + 20);
+        }
+      } else if (/documenta/i.test(goal) && /\.md$/i.test(file)) {
+        to = Math.min(total, 80);
+      } else if (total > MAX_SNIPPET_LINES) {
+        to = MAX_SNIPPET_LINES;
       }
-    } else if (/ollama|pull|serve/i.test(goal) && /\.md$/i.test(file)) {
-      const anchor = lines.findIndex((l) => /ollama/i.test(l));
-      if (anchor >= 0) {
-        from = Math.max(1, anchor - 4);
-        to = Math.min(total, anchor + 20);
-      }
-    } else if (/documenta/i.test(goal) && /\.md$/i.test(file)) {
-      to = Math.min(total, 80);
-    } else if (total > MAX_SNIPPET_LINES) {
-      to = MAX_SNIPPET_LINES;
     }
 
     const slice = lines.slice(from - 1, to);
@@ -328,8 +339,11 @@ export async function generateEditPlan(
   goal: string,
   projectContext: string,
   codeIndexSummary: string,
-  snippets: FileSnippet[]
+  snippets: FileSnippet[],
+  citedRanges?: FileLineCitation[]
 ): Promise<EditPlan | null> {
+  const citations = citedRanges?.length ? citedRanges : parseLineCitations(goal);
+  const citeBlock = formatCitationConstraint(citations);
   const snippetBlock = snippets.length > 0
     ? snippets.map(
       (s) => `### ${s.path} (linhas ${s.startLine}-${s.endLine})\n${s.numbered}`
@@ -354,12 +368,16 @@ export async function generateEditPlan(
         '  ]',
         '}',
         `Máximo ${MAX_PLAN_ITEMS} items. Intervalos de no máximo ~40 linhas por item.`,
-      ].join('\n'),
+        citeBlock
+          ? 'Se o usuário citou trechos com linhas, TODOS os items devem ficar DENTRO desses intervalos — nunca edite outras linhas do arquivo.'
+          : '',
+      ].filter(Boolean).join('\n'),
     },
     {
       role: 'user',
       content: [
         `Pedido: ${goal}`,
+        citeBlock,
         '',
         '## Projeto',
         projectContext || '(sem contexto)',
@@ -378,7 +396,26 @@ export async function generateEditPlan(
     maxResponseTokens: 4096,
   });
 
-  return parseEditPlan(response.content);
+  const plan = parseEditPlan(response.content);
+  return plan ? clampPlanToCitations(plan, citations) : null;
+}
+
+function clampPlanToCitations(plan: EditPlan, citations: FileLineCitation[]): EditPlan {
+  if (!citations.length) {
+    return plan;
+  }
+  for (const item of plan.items) {
+    const cite = findCitationForFile(citations, item.path);
+    if (!cite) {
+      continue;
+    }
+    if (item.start_line < cite.startLine || item.end_line > cite.endLine) {
+      item.start_line = cite.startLine;
+      item.end_line = cite.endLine;
+      item.description = `${item.description} (restrito ao trecho citado ${cite.startLine}-${cite.endLine})`;
+    }
+  }
+  return plan;
 }
 
 export async function generateEditForPlanItem(
@@ -387,8 +424,10 @@ export async function generateEditForPlanItem(
   goal: string,
   item: EditPlanItem,
   numberedContext: string,
-  completedItems: EditPlanItem[]
+  completedItems: EditPlanItem[],
+  citedRanges?: FileLineCitation[]
 ): Promise<Record<string, unknown> | null> {
+  const citeBlock = formatCitationConstraint(citedRanges);
   const doneSummary = completedItems
     .filter((i) => i.status === 'done')
     .map((i) => `- ${i.path}:${i.start_line}-${i.end_line} ✓`)
@@ -402,12 +441,14 @@ export async function generateEditForPlanItem(
         'Responda SOMENTE com JSON:',
         '{"name":"edit_file","arguments":{"path":"...","action":"replace_lines","start_line":N,"end_line":M,"content":"..."}}',
         'content usa \\n para quebras. Edite APENAS o intervalo deste item.',
-      ].join('\n'),
+        citeBlock ? 'Respeite o trecho citado pelo usuário — não altere linhas fora dele.' : '',
+      ].filter(Boolean).join('\n'),
     },
     {
       role: 'user',
       content: [
         `Pedido geral: ${goal}`,
+        citeBlock,
         '',
         `Alteração atual (${item.id}): ${item.description}`,
         `Arquivo: ${item.path}`,
@@ -453,6 +494,18 @@ export async function generateEditForPlanItem(
   args.action = 'replace_lines';
   args.start_line = args.start_line ?? item.start_line;
   args.end_line = args.end_line ?? item.end_line;
+
+  const clamped = clampEditToCitation(
+    String(args.path),
+    args.start_line,
+    args.end_line,
+    citedRanges
+  );
+  if (clamped) {
+    args.start_line = clamped.start_line;
+    args.end_line = clamped.end_line;
+  }
+
   return args;
 }
 
@@ -589,8 +642,47 @@ function findMarkdownCodeBlock(lines: string[], anchorLine: number): { start: nu
 /** Plano sem IA quando o pedido e o arquivo permitem inferência direta */
 export async function buildHeuristicPlan(
   workspaceRoot: string,
-  goal: string
+  goal: string,
+  citedRanges?: FileLineCitation[]
 ): Promise<EditPlan | null> {
+  const citations = citedRanges?.length ? citedRanges : parseLineCitations(goal);
+
+  if (citations.length > 0) {
+    const items: EditPlanItem[] = [];
+    for (let i = 0; i < citations.length; i++) {
+      const cite = citations[i];
+      let path = cite.path;
+      try {
+        await fs.access(resolveWorkspacePath(workspaceRoot, path));
+      } catch {
+        const discovered = await discoverTargetFiles(workspaceRoot, goal);
+        const match = discovered.find((f) => findCitationForFile([cite], f));
+        if (!match) {
+          continue;
+        }
+        path = match;
+      }
+      items.push({
+        id: `cite-${i + 1}`,
+        path,
+        start_line: cite.startLine,
+        end_line: cite.endLine,
+        description: `Atualizar trecho citado (${cite.startLine}-${cite.endLine}) conforme pedido`,
+        read_start: Math.max(1, cite.startLine - CONTEXT_PADDING),
+        read_end: cite.endLine + CONTEXT_PADDING,
+        status: 'pending',
+      });
+    }
+    if (items.length > 0) {
+      return {
+        analysis: 'Plano baseado no trecho citado pelo usuário — edite somente esse intervalo.',
+        requirements: ['Atualizar o trecho citado conforme pedido'],
+        items,
+        verificationRound: 0,
+      };
+    }
+  }
+
   const files = await discoverTargetFiles(workspaceRoot, goal);
   if (files.length === 0) {
     return null;
@@ -646,7 +738,7 @@ export async function buildHeuristicPlan(
           status: 'pending',
         });
       }
-    } else if (/documenta/i.test(goal) && /\.md$/i.test(file)) {
+    } else if (/documenta/i.test(goal) && /\.md$/i.test(file) && citations.length === 0) {
       items.push({
         id: 'doc-update',
         path: file,

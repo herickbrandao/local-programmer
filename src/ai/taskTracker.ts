@@ -5,6 +5,7 @@ import { ExecutionPhase, buildImplementPhaseMessage, createInitialPhase, needsMo
 import { FileReadCoverageMap, formatCoverageSummary } from '../tools/fileReadChunks';
 import type { EditPlan } from './editPlanPipeline';
 import { buildPlanContextBlock } from './editPlanPipeline';
+import { formatCitationConstraint, mergeLineCitations, parseLineCitations, type FileLineCitation } from './lineCitations';
 
 export type PlanPhase = 'idle' | 'planning' | 'executing' | 'verifying' | 'complete' | 'complete_with_warnings' | 'failed';
 
@@ -29,6 +30,8 @@ export interface TaskState {
   planPhase?: PlanPhase;
   /** Plano em etapas já executado neste subtask — evita repetir */
   planPipelineDone?: boolean;
+  /** Trechos @arquivo:linhas citados pelo usuário — edição restrita a estes intervalos */
+  citedRanges?: FileLineCitation[];
 }
 
 export function createTaskState(goal: string, intent: MessageIntent): TaskState {
@@ -45,6 +48,7 @@ export function createTaskState(goal: string, intent: MessageIntent): TaskState 
     forceImplement: false,
     fileReadCounts: {},
     fileReadCoverage: {},
+    citedRanges: parseLineCitations(goal),
   };
 }
 
@@ -73,6 +77,12 @@ export function buildTaskContextBlock(state: TaskState, phaseContext = ''): stri
   const planBlock = buildPlanContextBlock(state.editPlan);
   if (planBlock) {
     lines.push(planBlock);
+  }
+
+  const citeBlock = formatCitationConstraint(state.citedRanges);
+  if (citeBlock) {
+    lines.push(citeBlock);
+    lines.push('Edite SOMENTE os trechos citados acima — outras linhas estão bloqueadas.');
   }
 
   if (read.length > 0) {

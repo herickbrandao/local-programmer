@@ -9,6 +9,12 @@ import {
 import { extractFilenamesFromPrompt } from './taskCompletion';
 import { resolveWorkspacePath } from '../tools/pathUtils';
 import { extractToolCallsFromContent, toToolCalls } from './toolCallParser';
+import {
+  clampEditToCitation,
+  findCitationForFile,
+  formatCitationConstraint,
+  getPrimaryCitation,
+} from './lineCitations';
 
 const EDIT_FILE_TOOL: ToolDefinition = {
   name: 'edit_file',
@@ -33,6 +39,11 @@ export interface ForcedEditResult {
 }
 
 function inferFallbackTarget(taskState: TaskState, userPrompt: string): string | undefined {
+  const cite = getPrimaryCitation(taskState.citedRanges);
+  if (cite) {
+    return cite.path;
+  }
+
   const ready = listFilesReadyToEdit(taskState);
   if (ready[0]) {
     return ready[0];
@@ -111,9 +122,13 @@ export async function attemptForcedEdit(
   }
 
   const lines = content.split('\n');
-  const window = findEditWindow(lines, path, taskState.goal || userPrompt);
+  const cite = findCitationForFile(taskState.citedRanges, path);
+  const window = cite
+    ? { start: cite.startLine, end: cite.endLine }
+    : findEditWindow(lines, path, taskState.goal || userPrompt);
   const snippet = buildNumberedSnippet(lines, window.start, window.end);
   const hint = buildConcreteEditHint(path, taskState.goal || userPrompt);
+  const citeBlock = formatCitationConstraint(taskState.citedRanges);
 
   const messages: ChatMessage[] = [
     {
@@ -122,21 +137,27 @@ export async function attemptForcedEdit(
         'Você é um editor de código. Responda SOMENTE com um bloco ```json',
         'contendo: {"name":"edit_file","arguments":{"path":"...","action":"replace_lines","start_line":N,"end_line":M,"content":"..."}}',
         'Sem texto antes ou depois. content usa \\n para quebras de linha.',
-      ].join('\n'),
+        cite
+          ? `OBRIGATÓRIO: start_line=${cite.startLine} end_line=${cite.endLine} — trecho citado pelo usuário.`
+          : '',
+      ].filter(Boolean).join('\n'),
     },
     {
       role: 'user',
       content: [
         `Tarefa: ${taskState.goal || userPrompt}`,
         `Arquivo: ${path}`,
+        citeBlock,
         `Tentativa: ${attempt}`,
         hint,
         '',
         `Trecho atual (linhas ${window.start}-${window.end}):`,
         snippet,
         '',
-        'Gere edit_file replace_lines melhorando este trecho conforme a tarefa.',
-      ].join('\n'),
+        cite
+          ? `Substitua SOMENTE as linhas ${cite.startLine}-${cite.endLine} conforme a tarefa.`
+          : 'Gere edit_file replace_lines melhorando este trecho conforme a tarefa.',
+      ].filter(Boolean).join('\n'),
     },
   ];
 
@@ -169,6 +190,20 @@ export async function attemptForcedEdit(
     }
     if (args.action !== 'replace_lines') {
       args.action = 'replace_lines';
+    }
+
+    const clamped = clampEditToCitation(
+      String(args.path),
+      args.start_line,
+      args.end_line,
+      taskState.citedRanges
+    );
+    if (clamped) {
+      args.start_line = clamped.start_line;
+      args.end_line = clamped.end_line;
+    } else if (cite) {
+      args.start_line = cite.startLine;
+      args.end_line = cite.endLine;
     }
 
     return {

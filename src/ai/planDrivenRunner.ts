@@ -60,7 +60,12 @@ export async function runPlanDrivenPipeline(
   deps.emitThinking('Analisando pedido e montando plano de alterações...');
 
   const codeIndexSummary = await deps.contextManager.getCodeIndexSummary(deps.workspaceRoot);
-  const snippets = await loadFileSnippets(deps.workspaceRoot, goal);
+  const snippets = await loadFileSnippets(
+    deps.workspaceRoot,
+    goal,
+    [],
+    taskState.citedRanges
+  );
 
   for (const snippet of snippets) {
     taskState.filesRead.add(snippet.path);
@@ -73,17 +78,29 @@ export async function runPlanDrivenPipeline(
     );
   }
 
-  let plan = await generateEditPlan(
-    deps.provider,
-    deps.model,
-    goal,
-    projectContext,
-    codeIndexSummary,
-    snippets
-  );
+  let plan: EditPlan | null = null;
+
+  if (taskState.citedRanges?.length) {
+    plan = await buildHeuristicPlan(deps.workspaceRoot, goal, taskState.citedRanges);
+    if (plan) {
+      deps.emitThinking('Plano baseado no trecho citado (@arquivo:linhas).');
+    }
+  }
+
+  if (!plan) {
+    plan = await generateEditPlan(
+      deps.provider,
+      deps.model,
+      goal,
+      projectContext,
+      codeIndexSummary,
+      snippets,
+      taskState.citedRanges
+    );
+  }
 
   if (!plan || plan.items.length === 0) {
-    plan = await buildHeuristicPlan(deps.workspaceRoot, goal);
+    plan = await buildHeuristicPlan(deps.workspaceRoot, goal, taskState.citedRanges);
     if (plan) {
       deps.emitThinking('Plano inferido automaticamente (documentação / padrões conhecidos).');
     }
@@ -137,7 +154,8 @@ export async function runPlanDrivenPipeline(
           goal,
           item,
           ctx.numbered,
-          plan.items
+          plan.items,
+          taskState.citedRanges
         );
       }
 
@@ -249,7 +267,8 @@ export async function runPlanDrivenPipeline(
             goal,
             extra,
             ctx.numbered,
-            plan.items
+            plan.items,
+            taskState.citedRanges
           );
         }
 

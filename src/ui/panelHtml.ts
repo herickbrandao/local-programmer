@@ -895,12 +895,12 @@ export function getPanelHtml(): string {
       state.settings = settings;
       document.getElementById('ollamaUrl').value = settings.ollamaUrl || '';
       document.getElementById('connectionTimeoutMs').value = settings.connectionTimeoutMs || 30000;
-      document.getElementById('requestTimeoutMs').value = settings.requestTimeoutMs || 300000;
+      document.getElementById('requestTimeoutMs').value = settings.requestTimeoutMs || 500000;
       document.getElementById('temperature').value = settings.temperature ?? 0.2;
       document.getElementById('operationMode').value = settings.operationMode || 'chat';
       document.getElementById('permissionMode').value = settings.permissionMode || 'smart';
-      document.getElementById('maxAgentIterations').value = settings.maxAgentIterations || 20;
-      document.getElementById('maxResponseTokens').value = settings.maxResponseTokens || 8192;
+      document.getElementById('maxAgentIterations').value = settings.maxAgentIterations || 50;
+      document.getElementById('maxResponseTokens').value = settings.maxResponseTokens || 128000;
       document.getElementById('showThinking').checked = settings.showThinking !== false;
       document.getElementById('showToolCalls').checked = settings.showToolCalls !== false;
       document.getElementById('showToolResults').checked = settings.showToolResults !== false;

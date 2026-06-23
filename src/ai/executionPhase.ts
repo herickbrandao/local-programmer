@@ -5,6 +5,7 @@ import type { TaskState } from './taskTracker';
 import { extractFilenamesFromPrompt } from './taskCompletion';
 import { isFileFullyRead, getCoverageEntry, getNextUnreadRange } from '../tools/fileReadChunks';
 import { FileChange } from './types';
+import { validateEditWithinCitation } from './lineCitations';
 
 export type ExecutionPhase = 'explore' | 'implement';
 
@@ -283,6 +284,15 @@ export function getToolBlockReason(
   toolsMode: string,
   intent: MessageIntent
 ): string | null {
+  if (WRITE_TOOL_NAMES.has(toolName)) {
+    if (intent !== 'project_write') {
+      return 'Somente leitura — este pedido é investigação/análise, sem alterar arquivos. Use o modo Agente para editar.';
+    }
+    if (toolsMode === 'analyze') {
+      return 'Modo Análise — alterações bloqueadas. Mude para Agente se quiser editar arquivos.';
+    }
+  }
+
   if (!userRequiresEdits(state, toolsMode) || intent !== 'project_write') {
     return null;
   }
@@ -292,6 +302,11 @@ export function getToolBlockReason(
       'search_replace desativado — use replace_lines com start_line/end_line do read_file.',
       'Opcional: verify_content com o texto das linhas (sem prefixo N|).',
     ].join(' ');
+  }
+
+  const citeBlock = validateEditWithinCitation(filePath, args, state.citedRanges);
+  if (toolName === 'edit_file' && citeBlock) {
+    return citeBlock;
   }
 
   if (toolName === 'modify_file') {
@@ -420,6 +435,11 @@ export function buildEditRecoveryHint(args: Record<string, unknown>, errorOutput
 }
 
 export function pickPrimaryEditTarget(state: TaskState, userPrompt: string): string | null {
+  const cite = state.citedRanges?.[0];
+  if (cite) {
+    return cite.path;
+  }
+
   const ready = listFilesReadyToEdit(state);
   if (ready.length > 0) {
     return ready[0];

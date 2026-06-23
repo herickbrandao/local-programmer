@@ -6,7 +6,8 @@ import { PromptManager, SystemPromptOptions } from './promptManager';
 import { normalizeToolArguments } from './toolCallParser';
 import { IterationGuard } from './iterationGuard';
 import { checkWriteTaskComplete } from './taskCompletion';
-import { classifyMessageIntent, MessageIntent, resolveEffectiveIntent, resolveMessageMode } from './messageIntent';
+import { MessageIntent, resolveMessageMode } from './messageIntent';
+import { classifyIntentWithAI, formatIntentThinking } from './intentClassifier';
 import {
   analyzeTaskDecomposition,
   buildMergeMessage,
@@ -59,6 +60,7 @@ import { DiffManager } from '../editor/diffManager';
 import { ContextManager } from '../workspace/contextManager';
 import { attemptForcedEdit, buildEditSuccessMessage } from './editorFallback';
 import { runPlanDrivenPipeline, PlanRunnerResult } from './planDrivenRunner';
+import { mergeLineCitations, parseLineCitations } from './lineCitations';
 
 export class AgentController {
   private promptManager = new PromptManager();
@@ -149,27 +151,7 @@ export class AgentController {
     const mode = operationMode ?? getExtensionSettings().operationMode;
     this.currentOperationMode = mode;
 
-    const intent = classifyMessageIntent(userPrompt);
-    const effectiveIntent = resolveEffectiveIntent(userPrompt, intent, mode);
-    let allowWriteOverride = false;
-    if (mode === 'chat' && effectiveIntent === 'project_write') {
-      allowWriteOverride = await this.confirmWriteAction(userPrompt);
-    }
-    const resolved = resolveMessageMode(mode, effectiveIntent, allowWriteOverride);
-
-    const needsWorkspace = resolved.useTools && resolved.toolsMode !== 'chat';
-    if (needsWorkspace && !this.workspaceRoot) {
-      const initialized = await this.initializeWorkspace();
-      if (!initialized) {
-        this.emit({
-          type: 'error',
-          content: mode === 'analyze'
-            ? 'Abra uma pasta de projeto para analisar código.'
-            : 'Abra uma pasta de projeto antes de editar arquivos.',
-        });
-        return;
-      }
-    } else if (!this.workspaceRoot) {
+    if (!this.workspaceRoot) {
       await this.initializeWorkspace();
     }
 
@@ -177,17 +159,46 @@ export class AgentController {
 
     try {
       const settings = getExtensionSettings();
+      const model = settings.model;
+      const provider = this.providerRegistry.getActive();
+
+      this.emit({ type: 'thinking', content: 'Entendendo o pedido...' });
+      const classification = await classifyIntentWithAI(provider, model, userPrompt, mode);
+      const effectiveIntent = classification.intent;
+
+      let allowWriteOverride = false;
+      if (mode === 'chat' && effectiveIntent === 'project_write') {
+        allowWriteOverride = await this.confirmWriteAction(userPrompt);
+      }
+      const resolved = resolveMessageMode(mode, effectiveIntent, allowWriteOverride);
+
+      const needsWorkspace = resolved.useTools && resolved.toolsMode !== 'chat';
+      if (needsWorkspace && !this.workspaceRoot) {
+        const initialized = await this.initializeWorkspace();
+        if (!initialized) {
+          this.emit({
+            type: 'error',
+            content: mode === 'analyze'
+              ? 'Abra uma pasta de projeto para analisar código.'
+              : 'Abra uma pasta de projeto antes de editar arquivos.',
+          });
+          return;
+        }
+      }
+
       const maxIterations = resolved.useTools && resolved.toolsMode !== 'chat'
         ? settings.maxAgentIterations
         : 1;
-      const model = settings.model;
-      const provider = this.providerRegistry.getActive();
 
       const projectContext = this.workspaceRoot && resolved.useTools
         ? await this.contextManager.getProjectContext(this.workspaceRoot)
         : undefined;
 
       const taskState = createTaskState(displayPrompt ?? userPrompt, effectiveIntent);
+      taskState.citedRanges = mergeLineCitations(
+        taskState.citedRanges ?? [],
+        parseLineCitations(userPrompt)
+      );
 
       let decomposition = await analyzeTaskDecomposition(
         provider,
@@ -216,9 +227,7 @@ export class AgentController {
       } else if (resolved.useTools && effectiveIntent !== 'conversational') {
         this.emit({
           type: 'thinking',
-          content: effectiveIntent === 'project_write'
-            ? 'Entendi que você quer alterar o projeto...'
-            : 'Consultando o projeto...',
+          content: formatIntentThinking(classification),
         });
       }
 
@@ -276,7 +285,11 @@ export class AgentController {
 
         let skipAgentLoopForSubtask = false;
 
-        if (resolved.toolsMode === 'agent' && effectiveIntent === 'project_write') {
+        if (
+          mode === 'agent'
+          && resolved.toolsMode === 'agent'
+          && effectiveIntent === 'project_write'
+        ) {
           const planResult = await this.runPlanDrivenPipeline(
             provider,
             model,
@@ -895,6 +908,7 @@ export class AgentController {
       if (
         resolved.toolsMode === 'agent'
         && effectiveIntent === 'project_write'
+        && mode === 'agent'
         && sessionChanges.length === 0
         && !stoppedEarly
       ) {
@@ -1085,6 +1099,13 @@ export class AgentController {
     pendingChanges: PendingChange[],
     sessionChanges: FileChange[]
   ): Promise<boolean> {
+    if (
+      this.currentOperationMode === 'analyze'
+      || taskState.intent !== 'project_write'
+    ) {
+      return false;
+    }
+
     const maxAttempts = 3;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       this.emit({
