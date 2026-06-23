@@ -121,14 +121,33 @@ export async function attemptForcedEdit(
     return { success: false, message: `Arquivo não encontrado: ${path}` };
   }
 
-  const lines = content.split('\n');
   const cite = findCitationForFile(taskState.citedRanges, path);
+  const prep = taskState.citedEditPrep;
+
+  if (prep?.draftContent && prep.filePath === path.replace(/\\/g, '/')) {
+    return {
+      success: true,
+      message: `Usando rascunho da preparação para ${path}`,
+      args: {
+        path,
+        action: 'replace_lines',
+        start_line: prep.editStartLine,
+        end_line: prep.editEndLine,
+        content: prep.draftContent,
+      },
+    };
+  }
+
+  const lines = content.split('\n');
   const window = cite
     ? { start: cite.startLine, end: cite.endLine }
     : findEditWindow(lines, path, taskState.goal || userPrompt);
   const snippet = buildNumberedSnippet(lines, window.start, window.end);
   const hint = buildConcreteEditHint(path, taskState.goal || userPrompt);
   const citeBlock = formatCitationConstraint(taskState.citedRanges);
+  const structureBlock = prep?.projectTree
+    ? `\nEstrutura REAL do projeto (use esta — não invente):\n${prep.projectTree}`
+    : '';
 
   const messages: ChatMessage[] = [
     {
@@ -148,6 +167,7 @@ export async function attemptForcedEdit(
         `Tarefa: ${taskState.goal || userPrompt}`,
         `Arquivo: ${path}`,
         citeBlock,
+        structureBlock,
         `Tentativa: ${attempt}`,
         hint,
         '',

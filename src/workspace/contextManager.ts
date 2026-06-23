@@ -97,6 +97,16 @@ export class ContextManager {
     return this.loadCodeIndex();
   }
 
+  async getProjectFilePaths(workspaceRoot: string, prefix?: string): Promise<string[]> {
+    await this.getProjectContext(workspaceRoot);
+    const files = this.projectMap!.files.map((f) => f.path.replace(/\\/g, '/'));
+    if (!prefix) {
+      return files;
+    }
+    const normalized = prefix.replace(/\\/g, '/');
+    return files.filter((f) => f.startsWith(normalized));
+  }
+
   private async loadCodeIndex(): Promise<string> {
     try {
       const content = await fs.readFile(

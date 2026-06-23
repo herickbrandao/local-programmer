@@ -5,6 +5,7 @@ import { ExecutionPhase, buildImplementPhaseMessage, createInitialPhase, needsMo
 import { FileReadCoverageMap, formatCoverageSummary } from '../tools/fileReadChunks';
 import type { EditPlan } from './editPlanPipeline';
 import { buildPlanContextBlock } from './editPlanPipeline';
+import type { CitedEditPreparation } from './citedEditPipeline';
 import { formatCitationConstraint, mergeLineCitations, parseLineCitations, type FileLineCitation } from './lineCitations';
 
 export type PlanPhase = 'idle' | 'planning' | 'executing' | 'verifying' | 'complete' | 'complete_with_warnings' | 'failed';
@@ -32,6 +33,8 @@ export interface TaskState {
   planPipelineDone?: boolean;
   /** Trechos @arquivo:linhas citados pelo usuário — edição restrita a estes intervalos */
   citedRanges?: FileLineCitation[];
+  /** Preparação em etapas para edição citada (contexto → estrutura → rascunho → aplicar) */
+  citedEditPrep?: CitedEditPreparation;
 }
 
 export function createTaskState(goal: string, intent: MessageIntent): TaskState {

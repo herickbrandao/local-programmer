@@ -1155,6 +1155,15 @@ export class AgentController {
       });
 
       if (result.success) {
+        const unchanged = (result.data as { unchanged?: boolean } | undefined)?.unchanged;
+        if (unchanged) {
+          this.messages.push({
+            role: 'user',
+            content: '[Edição forçada não alterou o arquivo — conteúdo idêntico. Tente abordagem diferente.]',
+            internal: true,
+          });
+          continue;
+        }
         taskState.filesChanged = sessionChanges.map((c) => c.file);
         const msg = buildEditSuccessMessage(
           sessionChanges.map((c) => c.file),

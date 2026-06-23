@@ -22,6 +22,7 @@ import {
   loadItemContext,
   verifyEditPlan,
 } from './editPlanPipeline';
+import { runCitedEditPipeline } from './citedEditPipeline';
 
 export interface PlanRunnerDeps {
   provider: AIProvider;
@@ -57,6 +58,25 @@ export async function runPlanDrivenPipeline(
 ): Promise<PlanRunnerResult> {
   const initialChanges = sessionChanges.length;
 
+  if (taskState.citedRanges?.length) {
+    const citedResult = await runCitedEditPipeline(
+      goal,
+      taskState,
+      projectContext,
+      pendingChanges,
+      sessionChanges,
+      deps
+    );
+    if (citedResult.handled) {
+      return {
+        handled: true,
+        success: citedResult.success,
+        changesCount: citedResult.changesCount,
+        message: citedResult.message,
+      };
+    }
+  }
+
   deps.emitThinking('Analisando pedido e montando plano de alterações...');
 
   const codeIndexSummary = await deps.contextManager.getCodeIndexSummary(deps.workspaceRoot);
@@ -80,14 +100,7 @@ export async function runPlanDrivenPipeline(
 
   let plan: EditPlan | null = null;
 
-  if (taskState.citedRanges?.length) {
-    plan = await buildHeuristicPlan(deps.workspaceRoot, goal, taskState.citedRanges);
-    if (plan) {
-      deps.emitThinking('Plano baseado no trecho citado (@arquivo:linhas).');
-    }
-  }
-
-  if (!plan) {
+  if (!taskState.citedRanges?.length) {
     plan = await generateEditPlan(
       deps.provider,
       deps.model,
@@ -101,7 +114,7 @@ export async function runPlanDrivenPipeline(
 
   if (!plan || plan.items.length === 0) {
     plan = await buildHeuristicPlan(deps.workspaceRoot, goal, taskState.citedRanges);
-    if (plan) {
+    if (plan && !taskState.citedRanges?.length) {
       deps.emitThinking('Plano inferido automaticamente (documentação / padrões conhecidos).');
     }
   }

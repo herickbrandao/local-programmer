@@ -476,6 +476,16 @@ export async function generateEditForPlanItem(
   }
 
   if (!toolCall || toolCall.name !== 'edit_file') {
+    const fromJson = extractJsonContent(response.content);
+    if (fromJson) {
+      return {
+        path: item.path,
+        action: 'replace_lines',
+        start_line: item.start_line,
+        end_line: item.end_line,
+        content: fromJson,
+      };
+    }
     const plan = parseEditPlan(response.content);
     if (plan?.items[0]) {
       return {
@@ -507,6 +517,33 @@ export async function generateEditForPlanItem(
   }
 
   return args;
+}
+
+function extractJsonContent(text: string): string | null {
+  const block = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+  const candidates = [block?.[1]?.trim(), text.trim()].filter(Boolean) as string[];
+  for (const raw of candidates) {
+    try {
+      const parsed = JSON.parse(raw) as Record<string, unknown>;
+      if (typeof parsed.content === 'string' && parsed.content.trim()) {
+        return parsed.content;
+      }
+    } catch {
+      const start = raw.indexOf('{');
+      const end = raw.lastIndexOf('}');
+      if (start >= 0 && end > start) {
+        try {
+          const parsed = JSON.parse(raw.slice(start, end + 1)) as Record<string, unknown>;
+          if (typeof parsed.content === 'string' && parsed.content.trim()) {
+            return parsed.content;
+          }
+        } catch {
+          // próximo
+        }
+      }
+    }
+  }
+  return null;
 }
 
 export function parseVerificationResult(content: string): PlanVerificationResult {
