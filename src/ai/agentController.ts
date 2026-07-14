@@ -48,6 +48,7 @@ import { recordReadRange, isFileFullyRead } from '../tools/fileReadChunks';
 import { normalizeToolArgs, resolveWorkspacePath } from '../tools/pathUtils';
 import { AIProvider, AgentEvent,
   ChatMessage,
+  ChatOptions,
   FileChange,
   PermissionRequest,
   PendingChange,
@@ -61,6 +62,13 @@ import { ContextManager } from '../workspace/contextManager';
 import { attemptForcedEdit, buildEditSuccessMessage } from './editorFallback';
 import { runPlanDrivenPipeline, PlanRunnerResult } from './planDrivenRunner';
 import { mergeLineCitations, parseLineCitations } from './lineCitations';
+import { isAbortError } from './ollamaProvider';
+import { loadProjectRules } from '../workspace/projectRules';
+import {
+  CHAT_WITH_TOOLS_TOKENS,
+  EDIT_RESPONSE_TOKENS,
+  trimChatMessagesForRequest,
+} from './contextBudget';
 
 export class AgentController {
   private promptManager = new PromptManager();
@@ -73,6 +81,7 @@ export class AgentController {
   private messages: ChatMessage[] = [];
   private currentOperationMode: OperationMode = 'chat';
   private isRunning = false;
+  private abortController: AbortController | null = null;
   private workspaceRoot = '';
   private lastVersionId: string | null = null;
   private tokenTracker = new TokenTracker();
@@ -138,6 +147,35 @@ export class AgentController {
     return ollama.testConnection(overrides?.connectionTimeoutMs);
   }
 
+  stop(): void {
+    if (!this.isRunning || !this.abortController) {
+      return;
+    }
+    this.abortController.abort();
+    this.emit({ type: 'thinking', content: 'Parando...' });
+  }
+
+  isBusy(): boolean {
+    return this.isRunning;
+  }
+
+  private throwIfAborted(): void {
+    if (this.abortController?.signal.aborted) {
+      throw Object.assign(new Error('Requisição cancelada'), { name: 'AbortError' });
+    }
+  }
+
+  private buildChatOptions(overrides: ChatOptions = {}): ChatOptions {
+    const settings = getExtensionSettings();
+    return {
+      model: settings.model,
+      temperature: settings.temperature,
+      maxResponseTokens: settings.maxResponseTokens,
+      signal: this.abortController?.signal,
+      ...overrides,
+    };
+  }
+
   async sendMessage(
     userPrompt: string,
     operationMode?: OperationMode,
@@ -156,6 +194,7 @@ export class AgentController {
     }
 
     this.isRunning = true;
+    this.abortController = new AbortController();
 
     try {
       const settings = getExtensionSettings();
@@ -163,7 +202,14 @@ export class AgentController {
       const provider = this.providerRegistry.getActive();
 
       this.emit({ type: 'thinking', content: 'Entendendo o pedido...' });
-      const classification = await classifyIntentWithAI(provider, model, userPrompt, mode);
+      const classification = await classifyIntentWithAI(
+        provider,
+        model,
+        userPrompt,
+        mode,
+        this.abortController?.signal
+      );
+      this.throwIfAborted();
       const effectiveIntent = classification.intent;
 
       let allowWriteOverride = false;
@@ -190,9 +236,20 @@ export class AgentController {
         ? settings.maxAgentIterations
         : 1;
 
-      const projectContext = this.workspaceRoot && resolved.useTools
-        ? await this.contextManager.getProjectContext(this.workspaceRoot)
+      const useLean =
+        effectiveIntent === 'project_write' || resolved.toolsMode === 'agent';
+      let projectContext = this.workspaceRoot && resolved.useTools
+        ? (useLean
+          ? await this.contextManager.getLeanProjectContext(this.workspaceRoot)
+          : await this.contextManager.getProjectContext(this.workspaceRoot))
         : undefined;
+      if (this.workspaceRoot) {
+        const rules = await loadProjectRules(this.workspaceRoot);
+        if (rules) {
+          const rulesBudget = rules.length > 2000 ? `${rules.slice(0, 2000)}\n…` : rules;
+          projectContext = projectContext ? `${projectContext}\n\n${rulesBudget}` : rulesBudget;
+        }
+      }
 
       const taskState = createTaskState(displayPrompt ?? userPrompt, effectiveIntent);
       taskState.citedRanges = mergeLineCitations(
@@ -351,13 +408,31 @@ export class AgentController {
         forceTextOnly = false;
         const tools = toolDefs;
 
+        this.throwIfAborted();
         const editOnlyMode = shouldUseEditOnlyTools(taskState, userPrompt);
-        const response = await provider.chat(this.messages, {
-          model,
-          tools: tools.length > 0 ? tools : undefined,
-          requireToolCall: editOnlyMode && tools.length > 0,
-          maxResponseTokens: settings.maxResponseTokens,
-        });
+        const streamText = tools.length === 0;
+        const requestMessages = trimChatMessagesForRequest(
+          this.messages,
+          taskState.phase,
+          effectiveIntent
+        );
+        const responseTokens = tools.length > 0
+          ? Math.min(settings.maxResponseTokens, CHAT_WITH_TOOLS_TOKENS)
+          : settings.maxResponseTokens;
+        const response = await provider.chat(
+          requestMessages,
+          this.buildChatOptions({
+            model,
+            tools: tools.length > 0 ? tools : undefined,
+            requireToolCall: editOnlyMode && tools.length > 0,
+            maxResponseTokens: editOnlyMode
+              ? Math.min(responseTokens, EDIT_RESPONSE_TOKENS)
+              : responseTokens,
+            onToken: streamText
+              ? (delta) => this.emit({ type: 'stream_delta', content: delta })
+              : undefined,
+          })
+        );
 
         this.recordTokenUsage(response, model);
 
@@ -976,10 +1051,16 @@ export class AgentController {
 
       this.emit({ type: 'done', content: 'Concluído' });
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      this.emit({ type: 'error', content: message });
+      if (isAbortError(err) || this.abortController?.signal.aborted) {
+        this.emit({ type: 'cancelled', content: 'Execução interrompida pelo usuário.' });
+        this.emit({ type: 'done', content: 'Cancelado' });
+      } else {
+        const message = err instanceof Error ? err.message : String(err);
+        this.emit({ type: 'error', content: message });
+      }
     } finally {
       this.isRunning = false;
+      this.abortController = null;
     }
   }
 
@@ -1033,6 +1114,7 @@ export class AgentController {
       model,
       workspaceRoot: this.workspaceRoot,
       contextManager: this.contextManager,
+      signal: this.abortController?.signal,
       emitThinking: (content) => this.emit({ type: 'thinking', content }),
       emitMessage: (content) => {
         this.messages.push({ role: 'assistant', content });
@@ -1041,6 +1123,7 @@ export class AgentController {
       executeEdit: (args, state, pending, changes) =>
         this.executeToolWithPermission('edit_file', args, pending, changes, state),
       runCompileCheck: async () => {
+        this.throwIfAborted();
         const tool = this.toolRegistry.get('test_project');
         if (!tool) {
           return { ok: true, output: '' };
@@ -1113,13 +1196,15 @@ export class AgentController {
         content: `Aplicando edição automaticamente (${attempt}/${maxAttempts})...`,
       });
 
+      this.throwIfAborted();
       const forced = await attemptForcedEdit(
         provider,
         model,
         this.workspaceRoot,
         taskState,
         userPrompt,
-        attempt
+        attempt,
+        this.abortController?.signal
       );
 
       if (!forced.success || !forced.args) {

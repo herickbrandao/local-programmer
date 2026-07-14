@@ -15,7 +15,7 @@ const WRITE_TOOL_NAMES = new Set<string>(WRITE_TOOLS);
 const IMPLEMENT_TOOL_NAMES = new Set<string>(IMPLEMENT_TOOLS);
 
 /** Máximo de linhas por leitura na fase implementação (trecho novo ou reverificação) */
-const MAX_IMPLEMENT_READ_SPAN = 350;
+const MAX_IMPLEMENT_READ_SPAN = 120;
 const MAX_VERIFY_READ_SPAN = 30;
 
 /** Leituras totais (inclui chunks) antes de forçar implementação */
@@ -515,7 +515,7 @@ export function buildPhaseContextBlock(state: TaskState, toolsMode: string): str
   return [
     '',
     '## Exploração (leitura particionada — estilo Cursor)',
-    'Arquivos grandes vêm em blocos de ~350 linhas.',
+    'Arquivos grandes vêm em blocos de ~120 linhas — cite @arquivo:linhas quando possível.',
     'Use read_file → continue_read=true ou start_line=N para o próximo trecho.',
     'Leia só o necessário; depois edit_file + test_project.',
   ].join('\n');

@@ -53,7 +53,7 @@ export class ContextManager {
     return this.projectMap;
   }
 
-  async getProjectContext(workspaceRoot: string): Promise<string> {
+  private async ensureProjectMap(workspaceRoot: string): Promise<ProjectMap> {
     if (!this.projectMap) {
       try {
         const content = await fs.readFile(
@@ -65,8 +65,11 @@ export class ContextManager {
         this.projectMap = await this.indexProject(workspaceRoot);
       }
     }
+    return this.projectMap!;
+  }
 
-    const map = this.projectMap!;
+  async getProjectContext(workspaceRoot: string): Promise<string> {
+    const map = await this.ensureProjectMap(workspaceRoot);
     const langSummary = Object.entries(map.languages)
       .map(([lang, count]) => `${lang}: ${count}`)
       .join(', ');
@@ -92,13 +95,30 @@ export class ContextManager {
     ].join('\n');
   }
 
+  /** Contexto curto para implementação — menos tokens de prefill */
+  async getLeanProjectContext(workspaceRoot: string): Promise<string> {
+    const map = await this.ensureProjectMap(workspaceRoot);
+    const importantFiles = map.files
+      .filter((f) => this.isImportantFile(f.path))
+      .map((f) => f.path)
+      .slice(0, 18);
+
+    return [
+      `Raiz: ${map.root}`,
+      `Arquivos: ${map.totalFiles}`,
+      'Arquivos importantes:',
+      importantFiles.join('\n'),
+      '(Contexto enxuto — use read_file no trecho alvo; não explore o projeto inteiro.)',
+    ].join('\n');
+  }
+
   async getCodeIndexSummary(workspaceRoot: string): Promise<string> {
-    await this.getProjectContext(workspaceRoot);
+    await this.ensureProjectMap(workspaceRoot);
     return this.loadCodeIndex();
   }
 
   async getProjectFilePaths(workspaceRoot: string, prefix?: string): Promise<string[]> {
-    await this.getProjectContext(workspaceRoot);
+    await this.ensureProjectMap(workspaceRoot);
     const files = this.projectMap!.files.map((f) => f.path.replace(/\\/g, '/'));
     if (!prefix) {
       return files;

@@ -74,6 +74,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           case 'send':
             await this.onSend(message.text, message.model, message.operationMode);
             break;
+          case 'stop':
+            this.agent.stop();
+            break;
           case 'new_chat':
             await this.onNewChat();
             break;
@@ -483,6 +486,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     await this.onInsertEditorCitation();
   }
 
+  async citeActiveEditorFile(): Promise<void> {
+    await this.onInsertEditorCitation();
+  }
+
+  stopAgent(): void {
+    this.agent.stop();
+  }
+
+  async refreshModeFromSettings(): Promise<void> {
+    const settings = getExtensionSettings();
+    this.postMessage({
+      type: 'mode_updated',
+      operationMode: settings.operationMode,
+      settings,
+    });
+  }
+
   private async onPickFileCitation(): Promise<void> {
     const folders = vscode.workspace.workspaceFolders;
     if (!folders) {
@@ -668,6 +688,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private shouldPersistEvent(event: AgentEvent): boolean {
     const settings = getExtensionSettings();
+    if (event.type === 'stream_delta' || event.type === 'token_usage' || event.type === 'permission') {
+      return false;
+    }
     if (event.type === 'thinking' && !settings.showThinking) {
       return false;
     }
@@ -677,7 +700,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (event.type === 'tool_result' && !settings.showToolResults) {
       return false;
     }
-    return event.type !== 'done' && event.type !== 'permission';
+    return event.type !== 'done';
   }
 
   private agentEventToUiMessage(event: AgentEvent): UiMessage | null {
@@ -687,7 +710,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           ? { id: createUiMessageId(), kind: 'assistant', content: event.content }
           : null;
       case 'thinking':
-        return { kind: 'system', content: event.content };
+        return { kind: 'thinking', content: event.content };
       case 'tool_call':
         return { kind: 'tool', content: '🔧 ' + event.content };
       case 'tool_result': {
@@ -701,7 +724,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           data: event.data as Record<string, unknown>,
         };
       case 'checkpoint':
-        return { kind: 'system', content: '💾 ' + event.content };
+        return { kind: 'thinking', content: '💾 ' + event.content };
+      case 'cancelled':
+        return { kind: 'system', content: '⏹ ' + event.content };
       case 'error':
         return { kind: 'error', content: '❌ ' + event.content };
       default:

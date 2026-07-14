@@ -62,7 +62,8 @@ export async function classifyIntentWithAI(
   provider: AIProvider,
   model: string,
   userPrompt: string,
-  operationMode: OperationMode
+  operationMode: OperationMode,
+  signal?: AbortSignal
 ): Promise<IntentClassification> {
   if (operationMode === 'analyze') {
     return { intent: 'project_read', reason: 'Modo Análise — somente leitura', source: 'mode' };
@@ -102,6 +103,7 @@ export async function classifyIntentWithAI(
       model,
       temperature: 0,
       maxResponseTokens: 256,
+      signal,
     });
 
     const parsed = parseIntentResponse(response.content);

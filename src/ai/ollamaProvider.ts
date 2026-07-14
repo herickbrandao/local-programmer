@@ -14,9 +14,9 @@ interface OllamaMessage {
 }
 
 interface OllamaChatResponse {
-  message: {
+  message?: {
     role: string;
-    content: string;
+    content?: string;
     tool_calls?: Array<{
       function: {
         name: string;
@@ -25,7 +25,7 @@ interface OllamaChatResponse {
       };
     }>;
   };
-  done: boolean;
+  done?: boolean;
   prompt_eval_count?: number;
   eval_count?: number;
   done_reason?: string;
@@ -35,11 +35,23 @@ interface OllamaModel {
   name: string;
 }
 
+class AbortError extends Error {
+  constructor(message = 'Requisição cancelada') {
+    super(message);
+    this.name = 'AbortError';
+  }
+}
+
 function httpRequest(
   url: string,
-  options?: { method?: string; body?: string; timeoutMs?: number }
+  options?: { method?: string; body?: string; timeoutMs?: number; signal?: AbortSignal }
 ): Promise<{ status: number; body: string }> {
   return new Promise((resolve, reject) => {
+    if (options?.signal?.aborted) {
+      reject(new AbortError());
+      return;
+    }
+
     const parsed = new URL(url);
     const transport = parsed.protocol === 'https:' ? https : http;
     const timeoutMs = options?.timeoutMs ?? 30000;
@@ -64,7 +76,17 @@ function httpRequest(
       }
     );
 
+    const onAbort = () => {
+      req.destroy();
+      reject(new AbortError());
+    };
+    options?.signal?.addEventListener('abort', onAbort, { once: true });
+
     req.on('error', (err) => {
+      if (options?.signal?.aborted) {
+        reject(new AbortError());
+        return;
+      }
       reject(new Error(`Erro de conexão com Ollama: ${err.message}`));
     });
     req.on('timeout', () => {
@@ -73,6 +95,95 @@ function httpRequest(
     });
 
     if (options?.body) {
+      req.write(options.body);
+    }
+    req.end();
+  });
+}
+
+function httpStreamRequest(
+  url: string,
+  options: {
+    method?: string;
+    body?: string;
+    timeoutMs?: number;
+    signal?: AbortSignal;
+    onChunk: (line: string) => void;
+  }
+): Promise<{ status: number }> {
+  return new Promise((resolve, reject) => {
+    if (options.signal?.aborted) {
+      reject(new AbortError());
+      return;
+    }
+
+    const parsed = new URL(url);
+    const transport = parsed.protocol === 'https:' ? https : http;
+    const timeoutMs = options.timeoutMs ?? 300000;
+
+    const req = transport.request(
+      {
+        hostname: parsed.hostname,
+        port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
+        path: parsed.pathname + parsed.search,
+        method: options.method ?? 'POST',
+        headers: options.body
+          ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(options.body) }
+          : {},
+        timeout: timeoutMs,
+      },
+      (res) => {
+        const status = res.statusCode ?? 0;
+        if (status < 200 || status >= 300) {
+          const chunks: Buffer[] = [];
+          res.on('data', (c: Buffer) => chunks.push(c));
+          res.on('end', () => {
+            reject(new Error(`Ollama error (${status}): ${Buffer.concat(chunks).toString('utf-8')}`));
+          });
+          return;
+        }
+
+        let buffer = '';
+        res.on('data', (chunk: Buffer) => {
+          buffer += chunk.toString('utf-8');
+          const lines = buffer.split('\n');
+          buffer = lines.pop() ?? '';
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (trimmed) {
+              options.onChunk(trimmed);
+            }
+          }
+        });
+        res.on('end', () => {
+          const trimmed = buffer.trim();
+          if (trimmed) {
+            options.onChunk(trimmed);
+          }
+          resolve({ status });
+        });
+      }
+    );
+
+    const onAbort = () => {
+      req.destroy();
+      reject(new AbortError());
+    };
+    options.signal?.addEventListener('abort', onAbort, { once: true });
+
+    req.on('error', (err) => {
+      if (options.signal?.aborted) {
+        reject(new AbortError());
+        return;
+      }
+      reject(new Error(`Erro de conexão com Ollama: ${err.message}`));
+    });
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error(`Timeout (${Math.round(timeoutMs / 1000)}s) ao conectar ao Ollama — aumente em Configurações`));
+    });
+
+    if (options.body) {
       req.write(options.body);
     }
     req.end();
@@ -90,6 +201,21 @@ function parseOllamaToolArgs(
     return parseToolArguments(toolName, raw);
   }
   return {};
+}
+
+function collectToolCalls(data: OllamaChatResponse, content: string): ToolCall[] | undefined {
+  if (data.message?.tool_calls && data.message.tool_calls.length > 0) {
+    return data.message.tool_calls.map((tc, i) => ({
+      id: `call_${Date.now()}_${i}`,
+      name: tc.function.name,
+      arguments: parseOllamaToolArgs(
+        tc.function.name,
+        tc.function.arguments ?? tc.function.parameters
+      ),
+    }));
+  }
+  const extracted = extractToolCallsFromContent(content);
+  return extracted ? toToolCalls(extracted) : undefined;
 }
 
 export class OllamaProvider implements AIProvider {
@@ -171,7 +297,7 @@ export class OllamaProvider implements AIProvider {
     const body: Record<string, unknown> = {
       model,
       messages: ollamaMessages,
-      stream: false,
+      stream: true,
       options: {
         temperature: options?.temperature ?? settings.temperature,
         num_predict: options?.maxResponseTokens ?? settings.maxResponseTokens,
@@ -192,45 +318,73 @@ export class OllamaProvider implements AIProvider {
       }
     }
 
-    const response = await httpRequest(`${this.getUrl()}/api/chat`, {
-      method: 'POST',
-      body: JSON.stringify(body),
-      timeoutMs: settings.requestTimeoutMs,
-    });
+    let content = '';
+    let promptTokens = 0;
+    let completionTokens = 0;
+    let doneReason: string | undefined;
+    let lastToolCalls: ToolCall[] | undefined;
 
-    if (response.status < 200 || response.status >= 300) {
-      throw new Error(`Ollama error (${response.status}): ${response.body}`);
+    try {
+      await httpStreamRequest(`${this.getUrl()}/api/chat`, {
+        method: 'POST',
+        body: JSON.stringify(body),
+        timeoutMs: settings.requestTimeoutMs,
+        signal: options?.signal,
+        onChunk: (line) => {
+          if (options?.signal?.aborted) {
+            throw new AbortError();
+          }
+          let data: OllamaChatResponse;
+          try {
+            data = JSON.parse(line) as OllamaChatResponse;
+          } catch {
+            return;
+          }
+
+          const delta = data.message?.content ?? '';
+          if (delta) {
+            content += delta;
+            options?.onToken?.(delta);
+          }
+
+          if (data.message?.tool_calls?.length) {
+            lastToolCalls = collectToolCalls(data, content);
+          }
+
+          if (data.prompt_eval_count !== undefined) {
+            promptTokens = data.prompt_eval_count;
+          }
+          if (data.eval_count !== undefined) {
+            completionTokens = data.eval_count;
+          }
+          if (data.done_reason) {
+            doneReason = data.done_reason;
+          }
+        },
+      });
+    } catch (err) {
+      if (err instanceof AbortError || options?.signal?.aborted) {
+        throw new AbortError();
+      }
+      throw err;
     }
 
-    const data = JSON.parse(response.body) as OllamaChatResponse;
-    const content = data.message?.content ?? '';
-
-    let toolCalls: ToolCall[] | undefined;
-
-    if (data.message?.tool_calls && data.message.tool_calls.length > 0) {
-      toolCalls = data.message.tool_calls.map((tc, i) => ({
-        id: `call_${Date.now()}_${i}`,
-        name: tc.function.name,
-        arguments: parseOllamaToolArgs(
-          tc.function.name,
-          tc.function.arguments ?? tc.function.parameters
-        ),
-      }));
-    } else {
-      const extracted = extractToolCallsFromContent(content);
-      toolCalls = extracted ? toToolCalls(extracted) : undefined;
-    }
+    const toolCalls = lastToolCalls ?? collectToolCalls({ message: { role: 'assistant', content } }, content);
 
     return {
       content,
       toolCalls,
-      done: data.done,
-      doneReason: data.done_reason,
+      done: true,
+      doneReason,
       tokenUsage: {
-        promptTokens: data.prompt_eval_count ?? 0,
-        completionTokens: data.eval_count ?? 0,
-        totalTokens: (data.prompt_eval_count ?? 0) + (data.eval_count ?? 0),
+        promptTokens,
+        completionTokens,
+        totalTokens: promptTokens + completionTokens,
       },
     };
   }
+}
+
+export function isAbortError(err: unknown): boolean {
+  return err instanceof Error && (err.name === 'AbortError' || err.message === 'Requisição cancelada');
 }

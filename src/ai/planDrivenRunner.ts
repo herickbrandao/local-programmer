@@ -31,6 +31,7 @@ export interface PlanRunnerDeps {
   contextManager: ContextManager;
   emitThinking: (content: string) => void;
   emitMessage: (content: string) => void;
+  signal?: AbortSignal;
   executeEdit: (
     args: Record<string, unknown>,
     taskState: TaskState,
@@ -79,44 +80,49 @@ export async function runPlanDrivenPipeline(
 
   deps.emitThinking('Analisando pedido e montando plano de alterações...');
 
-  const codeIndexSummary = await deps.contextManager.getCodeIndexSummary(deps.workspaceRoot);
-  const snippets = await loadFileSnippets(
+  // Heurística primeiro (0 chamadas ao modelo) — só chama IA se falhar
+  let plan: EditPlan | null = await buildHeuristicPlan(
     deps.workspaceRoot,
     goal,
-    [],
     taskState.citedRanges
   );
-
-  for (const snippet of snippets) {
-    taskState.filesRead.add(snippet.path);
-    recordReadRange(
-      taskState.fileReadCoverage,
-      snippet.path,
-      snippet.startLine,
-      snippet.endLine,
-      snippet.totalLines
-    );
+  if (plan) {
+    deps.emitThinking('Plano rápido (sem IA) a partir do pedido / arquivos alvo.');
   }
 
-  let plan: EditPlan | null = null;
+  if (!plan || plan.items.length === 0) {
+    const snippets = await loadFileSnippets(
+      deps.workspaceRoot,
+      goal,
+      [],
+      taskState.citedRanges
+    );
 
-  if (!taskState.citedRanges?.length) {
+    for (const snippet of snippets) {
+      taskState.filesRead.add(snippet.path);
+      recordReadRange(
+        taskState.fileReadCoverage,
+        snippet.path,
+        snippet.startLine,
+        snippet.endLine,
+        snippet.totalLines
+      );
+    }
+
+    const leanContext = projectContext.length > 4000
+      ? `${projectContext.slice(0, 4000)}\n…[contexto truncado]`
+      : projectContext;
+
     plan = await generateEditPlan(
       deps.provider,
       deps.model,
       goal,
-      projectContext,
-      codeIndexSummary,
+      leanContext,
+      '',
       snippets,
-      taskState.citedRanges
+      taskState.citedRanges,
+      deps.signal
     );
-  }
-
-  if (!plan || plan.items.length === 0) {
-    plan = await buildHeuristicPlan(deps.workspaceRoot, goal, taskState.citedRanges);
-    if (plan && !taskState.citedRanges?.length) {
-      deps.emitThinking('Plano inferido automaticamente (documentação / padrões conhecidos).');
-    }
   }
 
   if (!plan || plan.items.length === 0) {
@@ -168,7 +174,8 @@ export async function runPlanDrivenPipeline(
           item,
           ctx.numbered,
           plan.items,
-          taskState.citedRanges
+          taskState.citedRanges,
+          deps.signal
         );
       }
 
@@ -220,11 +227,16 @@ export async function runPlanDrivenPipeline(
 
   taskState.planPhase = 'verifying';
 
-  const heuristicPlan = plan.analysis.includes('inferido automaticamente');
+  const heuristicPlan =
+    plan.analysis.includes('inferido automaticamente')
+    || plan.analysis.includes('Plano rápido')
+    || plan.analysis.includes('trecho citado');
   const allItemsDone = plan.items.every((i) => i.status === 'done');
+  const docsOnly = isDocumentationOnlyChanges(sessionChanges.map((c) => c.file));
+  const skipAiVerify = (heuristicPlan && allItemsDone) || (docsOnly && allItemsDone);
 
-  if (heuristicPlan && allItemsDone) {
-    deps.emitMessage('**Verificação:** documentação atualizada conforme plano automático.');
+  if (skipAiVerify) {
+    deps.emitMessage('**Verificação:** alterações aplicadas (verificação rápida — sem nova chamada ao modelo).');
   } else {
     deps.emitThinking('Verificando se o pedido foi atendido...');
 
@@ -234,7 +246,8 @@ export async function runPlanDrivenPipeline(
       deps.model,
       goal,
       plan,
-      sessionChanges.map((c) => c.file)
+      sessionChanges.map((c) => c.file),
+      deps.signal
     );
 
     plan.verificationRound += 1;
@@ -281,7 +294,8 @@ export async function runPlanDrivenPipeline(
             extra,
             ctx.numbered,
             plan.items,
-            taskState.citedRanges
+            taskState.citedRanges,
+            deps.signal
           );
         }
 

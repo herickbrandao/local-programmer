@@ -11,6 +11,11 @@ import {
   parseLineCitations,
   type FileLineCitation,
 } from './lineCitations';
+import {
+  EDIT_RESPONSE_TOKENS,
+  PLAN_RESPONSE_TOKENS,
+  VERIFY_RESPONSE_TOKENS,
+} from './contextBudget';
 
 export type EditPlanItemStatus = 'pending' | 'done' | 'failed' | 'skipped';
 
@@ -48,10 +53,10 @@ export interface FileSnippet {
   numbered: string;
 }
 
-const MAX_PLAN_ITEMS = 8;
-const MAX_VERIFY_ROUNDS = 2;
-const CONTEXT_PADDING = 8;
-const MAX_SNIPPET_LINES = 60;
+const MAX_PLAN_ITEMS = 5;
+const MAX_VERIFY_ROUNDS = 1;
+const CONTEXT_PADDING = 4;
+const MAX_SNIPPET_LINES = 40;
 
 export function inferTargetFiles(goal: string, projectContext?: string): string[] {
   const fromPrompt = extractFilenamesFromPrompt(goal);
@@ -340,7 +345,8 @@ export async function generateEditPlan(
   projectContext: string,
   codeIndexSummary: string,
   snippets: FileSnippet[],
-  citedRanges?: FileLineCitation[]
+  citedRanges?: FileLineCitation[],
+  signal?: AbortSignal
 ): Promise<EditPlan | null> {
   const citations = citedRanges?.length ? citedRanges : parseLineCitations(goal);
   const citeBlock = formatCitationConstraint(citations);
@@ -393,7 +399,8 @@ export async function generateEditPlan(
   const response = await provider.chat(messages, {
     model,
     temperature: 0,
-    maxResponseTokens: 4096,
+    maxResponseTokens: PLAN_RESPONSE_TOKENS,
+    signal,
   });
 
   const plan = parseEditPlan(response.content);
@@ -425,7 +432,8 @@ export async function generateEditForPlanItem(
   item: EditPlanItem,
   numberedContext: string,
   completedItems: EditPlanItem[],
-  citedRanges?: FileLineCitation[]
+  citedRanges?: FileLineCitation[],
+  signal?: AbortSignal
 ): Promise<Record<string, unknown> | null> {
   const citeBlock = formatCitationConstraint(citedRanges);
   const doneSummary = completedItems
@@ -464,7 +472,8 @@ export async function generateEditForPlanItem(
   const response = await provider.chat(messages, {
     model,
     temperature: 0,
-    maxResponseTokens: 8192,
+    maxResponseTokens: EDIT_RESPONSE_TOKENS,
+    signal,
   });
 
   let toolCall = response.toolCalls?.[0];
@@ -592,7 +601,8 @@ export async function verifyEditPlan(
   model: string,
   goal: string,
   plan: EditPlan,
-  changedFiles: string[]
+  changedFiles: string[],
+  signal?: AbortSignal
 ): Promise<PlanVerificationResult> {
   const itemReport = plan.items.map((item) => {
     const status = item.status === 'done' ? '✓' : item.status === 'failed' ? '✗' : '○';
@@ -636,7 +646,8 @@ export async function verifyEditPlan(
   const response = await provider.chat(messages, {
     model,
     temperature: 0,
-    maxResponseTokens: 2048,
+    maxResponseTokens: VERIFY_RESPONSE_TOKENS,
+    signal,
   });
 
   return parseVerificationResult(response.content);

@@ -97,15 +97,15 @@ export class IterationGuard {
     const count = (this.failedAttempts.get(fp) ?? 0) + 1;
     this.failedAttempts.set(fp, count);
 
-    if (recoverableEdit && count < 8) {
+    if (recoverableEdit && count < 3) {
       return null;
     }
 
-    if (toolName === 'read_file' && count < 8) {
+    if (toolName === 'read_file' && count < 3) {
       return null;
     }
 
-    if (count >= 3) {
+    if (count >= 2) {
       return {
         message: `Interrompido: a mesma ação falhou ${count} vezes sem progresso.\nÚltimo erro: ${output}`,
       };
@@ -143,9 +143,9 @@ export class IterationGuard {
     }
 
     this.consecutiveEmptyIterations++;
-    if (this.consecutiveEmptyIterations >= 4) {
+    if (this.consecutiveEmptyIterations >= 2) {
       return {
-        message: 'Interrompido: o agente não conseguiu progresso nas últimas iterações.',
+        message: 'Interrompido: sem progresso nas últimas iterações — use @arquivo:linhas ou refine o pedido.',
       };
     }
 

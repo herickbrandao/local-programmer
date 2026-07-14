@@ -3,9 +3,12 @@ import { ChatViewProvider } from './ui/chatViewProvider';
 import { registerDiffProviders } from './editor/diffManager';
 import { SnapshotManager } from './history/snapshotManager';
 import { RollbackManager } from './history/rollbackManager';
+import { getExtensionSettings, OperationMode, updateExtensionSettings } from './config/settings';
 
 let snapshotManager: SnapshotManager;
 let rollbackManager: RollbackManager;
+
+const OPERATION_MODES: OperationMode[] = ['chat', 'analyze', 'agent'];
 
 export function activate(context: vscode.ExtensionContext): void {
   const chatProvider = new ChatViewProvider(context.extensionUri, context);
@@ -87,6 +90,29 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('localProgrammer.citeInChat', async () => {
       await vscode.commands.executeCommand('localProgrammer.chatView.focus');
       await chatProvider.insertEditorCitation();
+    }),
+
+    vscode.commands.registerCommand('localProgrammer.citeOpenFile', async () => {
+      await vscode.commands.executeCommand('localProgrammer.chatView.focus');
+      await chatProvider.citeActiveEditorFile();
+    }),
+
+    vscode.commands.registerCommand('localProgrammer.cycleMode', async () => {
+      const current = getExtensionSettings().operationMode;
+      const idx = OPERATION_MODES.indexOf(current);
+      const next = OPERATION_MODES[(idx + 1) % OPERATION_MODES.length];
+      await updateExtensionSettings({ operationMode: next });
+      await chatProvider.refreshModeFromSettings();
+      const labels: Record<OperationMode, string> = {
+        chat: 'Chat',
+        analyze: 'Análise',
+        agent: 'Agente',
+      };
+      vscode.window.setStatusBarMessage(`Local Programmer: modo ${labels[next]}`, 2500);
+    }),
+
+    vscode.commands.registerCommand('localProgrammer.stopAgent', () => {
+      chatProvider.stopAgent();
     })
   );
 

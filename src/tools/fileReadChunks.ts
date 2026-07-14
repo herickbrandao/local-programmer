@@ -1,5 +1,5 @@
-export const DEFAULT_CHUNK_LINES = 350;
-export const LARGE_FILE_THRESHOLD = 120;
+export const DEFAULT_CHUNK_LINES = 120;
+export const LARGE_FILE_THRESHOLD = 80;
 
 export interface LineRange {
   from: number;

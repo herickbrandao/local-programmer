@@ -105,7 +105,8 @@ export async function attemptForcedEdit(
   workspaceRoot: string,
   taskState: TaskState,
   userPrompt: string,
-  attempt: number
+  attempt: number,
+  signal?: AbortSignal
 ): Promise<ForcedEditResult> {
   const ready = listFilesReadyToEdit(taskState);
   const path = inferFallbackTarget(taskState, userPrompt);
@@ -186,7 +187,8 @@ export async function attemptForcedEdit(
       model,
       tools: [EDIT_FILE_TOOL],
       temperature: 0,
-      maxResponseTokens: 8192,
+      maxResponseTokens: 3072,
+      signal,
     });
 
     let toolCall = response.toolCalls?.[0];

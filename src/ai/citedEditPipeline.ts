@@ -19,6 +19,7 @@ import {
 } from './projectTreeFormatter';
 import { formatNumberedLines } from '../tools/fileReadChunks';
 import { extractToolCallsFromContent, toToolCalls } from './toolCallParser';
+import { EDIT_RESPONSE_TOKENS } from './contextBudget';
 
 export interface CitedEditDeps {
   provider: AIProvider;
@@ -27,6 +28,7 @@ export interface CitedEditDeps {
   contextManager: ContextManager;
   emitThinking: (content: string) => void;
   emitMessage: (content: string) => void;
+  signal?: AbortSignal;
   executeEdit: (
     args: Record<string, unknown>,
     taskState: TaskState,
@@ -224,7 +226,8 @@ async function draftContentWithAI(
   goal: string,
   prep: CitedEditPreparation,
   numberedOriginal: string,
-  extraContext: string
+  extraContext: string,
+  signal?: AbortSignal
 ): Promise<string | null> {
   const citeBlock = formatCitationConstraint([prep.cite]);
   const messages: ChatMessage[] = [
@@ -261,7 +264,8 @@ async function draftContentWithAI(
   const response = await provider.chat(messages, {
     model,
     temperature: 0,
-    maxResponseTokens: 8192,
+    maxResponseTokens: EDIT_RESPONSE_TOKENS,
+    signal,
   });
 
   const fromJson = extractJsonContent(response.content);
@@ -400,7 +404,8 @@ export async function runCitedEditPipeline(
       goal,
       prep,
       numbered,
-      extraContext
+      extraContext,
+      deps.signal
     );
     if (!drafted) {
       setStep(prep, 'draft_change', 'failed', 'Modelo não gerou conteúdo');

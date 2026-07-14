@@ -117,7 +117,7 @@ export function shouldAutoContinue(
   _hadToolCalls: boolean,
   userPrompt?: string
 ): boolean {
-  const maxContinuations = 25;
+  const maxContinuations = 8;
   if (state.continuationCount >= maxContinuations) {
     return false;
   }

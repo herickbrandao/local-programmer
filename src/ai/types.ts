@@ -19,6 +19,10 @@ export interface ChatOptions {
   maxResponseTokens?: number;
   /** Ollama: força o modelo a emitir tool_calls em vez de só texto */
   requireToolCall?: boolean;
+  /** Cancela a requisição HTTP em andamento */
+  signal?: AbortSignal;
+  /** Callback de streaming (deltas de texto) */
+  onToken?: (delta: string) => void;
 }
 
 export interface ToolDefinition {
@@ -89,7 +93,20 @@ export interface FileChangedData {
 }
 
 export interface AgentEvent {
-  type: 'thinking' | 'tool_call' | 'tool_result' | 'permission' | 'diff' | 'file_changed' | 'message' | 'error' | 'checkpoint' | 'done' | 'token_usage';
+  type:
+    | 'thinking'
+    | 'tool_call'
+    | 'tool_result'
+    | 'permission'
+    | 'diff'
+    | 'file_changed'
+    | 'message'
+    | 'error'
+    | 'checkpoint'
+    | 'done'
+    | 'token_usage'
+    | 'stream_delta'
+    | 'cancelled';
   content: string;
   data?: unknown;
 }

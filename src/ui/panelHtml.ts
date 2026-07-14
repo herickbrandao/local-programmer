@@ -226,7 +226,7 @@ export function getPanelHtml(): string {
       max-height: 150px;
     }
     textarea:focus { outline: 1px solid var(--vscode-focusBorder); }
-    .send-btn {
+    .send-btn, .stop-btn {
       align-self: flex-end;
       padding: 8px 16px;
       background: var(--vscode-button-background);
@@ -238,6 +238,99 @@ export function getPanelHtml(): string {
       font-size: 13px;
     }
     .send-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .stop-btn {
+      display: none;
+      background: var(--vscode-errorForeground);
+      color: var(--vscode-editor-background);
+    }
+    .stop-btn:hover { opacity: 0.9; }
+    /* Wrapper evita bug do webview: summary com display:flex colapsa altura → some do chat */
+    .activity-wrap {
+      align-self: stretch;
+      width: 100%;
+      flex: 0 0 auto;
+      min-height: 36px;
+    }
+    .activity-accordion {
+      display: block;
+      width: 100%;
+      border: 1px solid var(--vscode-panel-border);
+      border-radius: 6px;
+      background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
+      font-size: 12px;
+      overflow: hidden;
+    }
+    .activity-accordion > summary {
+      display: block;
+      list-style: none;
+      cursor: pointer;
+      padding: 8px 12px;
+      color: var(--vscode-descriptionForeground);
+      user-select: none;
+      min-height: 20px;
+      line-height: 1.4;
+    }
+    .activity-accordion > summary::-webkit-details-marker { display: none; }
+    .activity-summary-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      width: 100%;
+      box-sizing: border-box;
+    }
+    .activity-chevron {
+      flex-shrink: 0;
+      width: 12px;
+      font-size: 10px;
+      color: var(--vscode-textLink-foreground);
+      transition: transform 0.15s ease;
+      display: inline-block;
+    }
+    .activity-accordion[open] .activity-chevron { transform: rotate(90deg); }
+    .activity-title {
+      flex: 1 1 auto;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      color: var(--vscode-foreground);
+    }
+    .activity-meta {
+      flex: 0 0 auto;
+      font-size: 11px;
+      opacity: 0.85;
+      white-space: nowrap;
+    }
+    .activity-body {
+      display: block;
+      border-top: 1px solid var(--vscode-panel-border);
+      max-height: 220px;
+      overflow-y: auto;
+      padding: 6px 0;
+      background: var(--vscode-sideBar-background);
+    }
+    .activity-item {
+      padding: 4px 12px;
+      font-size: 11px;
+      line-height: 1.4;
+      white-space: pre-wrap;
+      word-break: break-word;
+      color: var(--vscode-descriptionForeground);
+      border-left: 2px solid transparent;
+      margin: 2px 8px;
+    }
+    .activity-item.activity-thinking { border-left-color: var(--vscode-textLink-foreground); }
+    .activity-item.activity-tool {
+      border-left-color: var(--vscode-gitDecoration-modifiedResourceForeground, #e2c08d);
+      font-family: var(--vscode-editor-font-family);
+    }
+    .message.assistant.streaming { opacity: 0.95; }
+    .message.assistant.streaming::after {
+      content: '▍
+      animation: blink 1s step-end infinite;
+      color: var(--vscode-textLink-foreground);
+    }
+    @keyframes blink { 50% { opacity: 0; } }
     .settings-scroll {
       flex: 1;
       overflow-y: auto;
@@ -541,6 +634,7 @@ export function getPanelHtml(): string {
       <div class="input-wrapper">
         <textarea id="promptInput" placeholder="Use @arquivo.ts:10-20 ou @msg:id para citar. Ex: adicione opção de citar mensagem..." rows="3"></textarea>
         <button id="sendBtn" class="send-btn">Enviar</button>
+        <button id="stopBtn" class="stop-btn" type="button" title="Interromper execução">Parar</button>
       </div>
     </div>
   </div>
@@ -615,7 +709,7 @@ export function getPanelHtml(): string {
 
         <div class="form-group checkbox">
           <input type="checkbox" id="showThinking">
-          <label for="showThinking">Mostrar thinking / iterações</label>
+          <label for="showThinking">Incluir atividade do agente (accordion minimizado)</label>
         </div>
 
         <div class="form-group checkbox">
@@ -648,12 +742,15 @@ export function getPanelHtml(): string {
       chatUi: { model: '', operationMode: 'chat', userLocked: false },
       tokenStats: null,
       messageById: {},
+      activity: { el: null, body: null, summary: null, wrap: null, count: 0 },
+      streaming: { el: null, content: '' },
     };
 
     const els = {
       messages: document.getElementById('messages'),
       promptInput: document.getElementById('promptInput'),
       sendBtn: document.getElementById('sendBtn'),
+      stopBtn: document.getElementById('stopBtn'),
       modelSelect: document.getElementById('modelSelect'),
       operationModeSelect: document.getElementById('operationModeSelect'),
       settingsModel: document.getElementById('settingsModel'),
@@ -799,15 +896,135 @@ export function getPanelHtml(): string {
       }
     }
 
+    function isActivityKind(kind) {
+      return kind === 'thinking' || kind === 'tool';
+    }
+
+    function resetActivityState() {
+      state.activity = { el: null, body: null, summary: null, wrap: null, count: 0 };
+    }
+
+    function sealActivityAccordion() {
+      if (!state.activity.el) return;
+      const count = state.activity.count;
+      const meta = state.activity.summary?.querySelector('.activity-meta');
+      const title = state.activity.summary?.querySelector('.activity-title');
+      if (meta) meta.textContent = count + ' passo' + (count === 1 ? '' : 's');
+      if (title) title.textContent = 'Atividade do agente';
+      state.activity.el.open = false;
+      state.activity.el.setAttribute('data-sealed', '1');
+      resetActivityState();
+    }
+
+    function addActivityItem(content, variant) {
+      if (!content || !String(content).trim()) return;
+
+      if (!state.activity.el || !state.activity.el.isConnected) {
+        const wrap = document.createElement('div');
+        wrap.className = 'activity-wrap';
+
+        const details = document.createElement('details');
+        details.className = 'activity-accordion';
+        details.open = false;
+
+        const summary = document.createElement('summary');
+        summary.innerHTML =
+          '<span class="activity-summary-row">' +
+          '<span class="activity-chevron" aria-hidden="true">▸</span>' +
+          '<span class="activity-title">Atividade do agente</span>' +
+          '<span class="activity-meta">0 passos</span>' +
+          '</span>';
+
+        const body = document.createElement('div');
+        body.className = 'activity-body';
+
+        details.appendChild(summary);
+        details.appendChild(body);
+        wrap.appendChild(details);
+        els.messages.appendChild(wrap);
+        state.activity = { el: details, body, summary, wrap, count: 0 };
+      }
+
+      state.activity.count += 1;
+      const item = document.createElement('div');
+      item.className = 'activity-item activity-' + variant;
+      item.textContent = content;
+      state.activity.body.appendChild(item);
+
+      const meta = state.activity.summary.querySelector('.activity-meta');
+      const title = state.activity.summary.querySelector('.activity-title');
+      const preview = String(content).replace(/\\s+/g, ' ').trim();
+      if (meta) meta.textContent = state.activity.count + ' passo' + (state.activity.count === 1 ? '' : 's');
+      if (title) title.textContent = preview.length > 72 ? preview.slice(0, 69) + '…' : preview;
+      state.activity.el.open = false;
+      els.messages.scrollTop = els.messages.scrollHeight;
+    }
+
+    function clearStreamingMessage() {
+      if (state.streaming.el?.isConnected) {
+        state.streaming.el.remove();
+      }
+      state.streaming = { el: null, content: '' };
+    }
+
+    function appendStreamDelta(delta) {
+      if (!delta) return;
+      if (!state.streaming.el || !state.streaming.el.isConnected) {
+        sealActivityAccordion();
+        const div = document.createElement('div');
+        div.className = 'message assistant streaming';
+        const body = document.createElement('div');
+        body.className = 'message-content md-text';
+        div.appendChild(body);
+        els.messages.appendChild(div);
+        state.streaming = { el: div, content: '' };
+      }
+      state.streaming.content += delta;
+      const body = state.streaming.el.querySelector('.message-content');
+      if (body) body.textContent = state.streaming.content;
+      els.messages.scrollTop = els.messages.scrollHeight;
+    }
+
+    function finalizeStreamingAsAssistant(content, msgMeta) {
+      clearStreamingMessage();
+      addMessage(content, 'assistant', msgMeta);
+    }
+
     function renderUiMessage(msg) {
       if (!msg) return;
       switch (msg.kind) {
-        case 'user': addMessage(msg.content, 'user', msg); break;
-        case 'assistant': addMessage(msg.content, 'assistant', msg); break;
-        case 'system': addMessage(msg.content, 'system', msg); break;
-        case 'tool': addMessage(msg.content, 'tool', msg); break;
-        case 'error': addMessage(msg.content, 'error', msg); break;
-        case 'file_change': addFileChangeCard(msg.data); break;
+        case 'user':
+          sealActivityAccordion();
+          clearStreamingMessage();
+          addMessage(msg.content, 'user', msg);
+          break;
+        case 'assistant':
+          sealActivityAccordion();
+          if (state.streaming.el) {
+            finalizeStreamingAsAssistant(msg.content, msg);
+          } else {
+            addMessage(msg.content, 'assistant', msg);
+          }
+          break;
+        case 'system':
+          sealActivityAccordion();
+          addMessage(msg.content, 'system', msg);
+          break;
+        case 'thinking':
+          addActivityItem(msg.content, 'thinking');
+          break;
+        case 'tool':
+          addActivityItem(msg.content, 'tool');
+          break;
+        case 'error':
+          sealActivityAccordion();
+          clearStreamingMessage();
+          addMessage(msg.content, 'error', msg);
+          break;
+        case 'file_change':
+          sealActivityAccordion();
+          addFileChangeCard(msg.data);
+          break;
       }
     }
 
@@ -815,7 +1032,10 @@ export function getPanelHtml(): string {
       els.messages.innerHTML = '';
       state.fileChangeData.clear();
       state.messageById = {};
+      resetActivityState();
+      clearStreamingMessage();
       (messages || []).forEach(renderUiMessage);
+      sealActivityAccordion();
     }
 
     function addFileChangeCard(data) {
@@ -1222,14 +1442,25 @@ export function getPanelHtml(): string {
     function setProcessing(processing) {
       state.isProcessing = processing;
       els.sendBtn.disabled = processing;
-      els.promptInput.disabled = processing;
+      els.sendBtn.style.display = processing ? 'none' : '';
+      if (els.stopBtn) {
+        els.stopBtn.style.display = processing ? '' : 'none';
+      }
       if (els.processing) {
         els.processing.classList.toggle('visible', processing);
+        els.processing.textContent = processing ? 'Trabalhando…' : 'Pensando...';
+      }
+      if (!processing) {
+        sealActivityAccordion();
       }
     }
 
 
     els.sendBtn.addEventListener('click', send);
+    els.stopBtn?.addEventListener('click', () => {
+      vscode.postMessage({ type: 'stop' });
+      if (els.processing) els.processing.textContent = 'Parando…';
+    });
     els.promptInput.addEventListener('keydown', e => {
       if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
     });
@@ -1375,12 +1606,33 @@ export function getPanelHtml(): string {
         case 'insert_citation':
           if (msg.text) insertAtCursor(msg.text);
           break;
+        case 'mode_updated':
+          if (msg.operationMode && els.operationModeSelect) {
+            els.operationModeSelect.value = msg.operationMode;
+            state.settings.operationMode = msg.operationMode;
+            state.chatUi.operationMode = msg.operationMode;
+            updatePlaceholder(msg.operationMode);
+          }
+          if (msg.settings) fillSettingsForm(msg.settings);
+          break;
         case 'token_stats':
           updateTokenDisplay(msg.stats);
           break;
         case 'agent_event': {
           const ev = msg.event;
-          if (ev.type === 'done' || ev.type === 'error') setProcessing(false);
+          if (ev.type === 'stream_delta') {
+            appendStreamDelta(ev.content || '');
+          }
+          if (ev.type === 'done' || ev.type === 'error' || ev.type === 'cancelled') {
+            sealActivityAccordion();
+            if (ev.type !== 'done' || !state.streaming.el) {
+              // keep streaming el until assistant message arrives; seal on done without stream
+            }
+            if (ev.type === 'done' && state.streaming.el && state.streaming.content) {
+              finalizeStreamingAsAssistant(state.streaming.content, { id: 'stream_' + Date.now() });
+            }
+            setProcessing(false);
+          }
           if (msg.settings) state.settings = msg.settings;
           break;
         }

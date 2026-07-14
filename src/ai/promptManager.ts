@@ -12,7 +12,7 @@ export interface SystemPromptOptions {
 const ALL_TOOLS: ToolDefinition[] = [
   {
     name: 'read_file',
-    description: 'Lê arquivo em trechos (~350 linhas). Arquivos grandes vêm particionados automaticamente.',
+    description: 'Lê arquivo em trechos (~120 linhas). Prefira start_line/end_line no trecho alvo.',
     parameters: {
       type: 'object',
       properties: {
@@ -20,7 +20,7 @@ const ALL_TOOLS: ToolDefinition[] = [
         start_line: { type: 'number', description: 'Linha inicial (1-based). Para trecho específico ou busca por linha.' },
         end_line: { type: 'number', description: 'Linha final inclusive (opcional)' },
         continue_read: { type: 'boolean', description: 'true = próximo bloco após o último lido deste arquivo' },
-        chunk_size: { type: 'number', description: 'Tamanho do bloco em linhas (padrão 350)' },
+        chunk_size: { type: 'number', description: 'Tamanho do bloco em linhas (padrão 120)' },
       },
       required: ['path'],
     },
@@ -242,7 +242,7 @@ ${contextSection}${taskSection}`;
 ## FASE ATUAL: IMPLEMENTAÇÃO
 - Leitura ampla ENCERRADA — não use read_file sem start_line/end_line
 - **search_files** permitido para achar linha (ex: nome de função ou classe CSS)
-- **read_file** permitido: trecho ≤350 linhas não lido OU ≤30 linhas para reverificar
+- **read_file** permitido: trecho ≤120 linhas não lido OU ≤30 linhas para reverificar
 - Use **edit_file replace_lines** — NUNCA reescreva o arquivo inteiro
 - Depois de editar, chame **test_project** para validar`
       : `
@@ -260,7 +260,7 @@ Se o plano automático falhar, continue manualmente com edit_file em trechos peq
 Nunca encerre só com texto se o pedido pedia mudança no código.
 
 ## Fluxo recomendado (estilo Cursor/Codex)
-1. **read_file** — primeiro bloco (automático ~350 linhas se grande)
+1. **read_file** — trecho alvo (automático ~120 linhas; better: @arquivo:linhas)
 2. **continue_read=true** ou **start_line=N** — próximos trechos só se precisar
 3. **edit_file** — alteração cirúrgica no trecho relevante
 4. **test_project** — compile/test
