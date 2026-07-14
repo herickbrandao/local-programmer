@@ -4,15 +4,19 @@ Extensão VSCode de agente de programação com IA local via Ollama. Alternativa
 
 ## Funcionalidades
 
-- **Chat lateral** com IA local (Ollama)
+- **Chat lateral** com IA local (Ollama) e **streaming** de respostas
+- **Modos** Chat / Análise / Agente (atalho `Ctrl+.` / `Cmd+.`)
+- **Parar execução** no painel ou `Ctrl+Shift+Backspace`
+- **Accordion de atividade** — thinking/tools ficam minimizados
 - **Agente com ferramentas**: ler, criar, modificar, excluir arquivos e executar comandos
+- **Citações** `@arquivo:linhas` e seleção do editor (`Ctrl+Shift+L`)
+- **Rules do projeto** em `.local-programmer/rules.md`
 - **Diff visual** estilo Git com aceitar/rejeitar alterações
 - **Snapshots automáticos** em `.ai-history/version_XXX/`
 - **Rollback completo** — reverta qualquer alteração
 - **Comparação entre versões**
 - **Sistema de permissões** (Manual / Smart / Auto)
 - **Indexação de projeto** com mapa de arquivos e dependências
-- **Arquitetura multi-provider** preparada para OpenAI e Claude
 
 ## Pré-requisitos
 
