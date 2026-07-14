@@ -21,21 +21,26 @@ export class RollbackManager {
     return this.restoreVersion(lastVersion.id);
   }
 
-  async restoreVersion(versionId: string): Promise<boolean> {
+  async restoreVersion(
+    versionId: string,
+    options?: { skipConfirm?: boolean }
+  ): Promise<boolean> {
     const manifest = await this.snapshotManager.getVersion(versionId);
     if (!manifest) {
       vscode.window.showErrorMessage(`Versão não encontrada: ${versionId}`);
       return false;
     }
 
-    const confirm = await vscode.window.showWarningMessage(
-      `Restaurar projeto para ${versionId} (${manifest.date})?`,
-      { modal: true },
-      'Restaurar'
-    );
+    if (!options?.skipConfirm) {
+      const confirm = await vscode.window.showWarningMessage(
+        `Restaurar projeto para ${versionId} (${manifest.date})?`,
+        { modal: true },
+        'Restaurar'
+      );
 
-    if (confirm !== 'Restaurar') {
-      return false;
+      if (confirm !== 'Restaurar') {
+        return false;
+      }
     }
 
     for (const change of manifest.changes) {

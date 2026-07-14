@@ -3,7 +3,17 @@ import { AIProvider, ChatMessage } from './types';
 
 export function looksLikeManualInstructions(response: string): boolean {
   const lower = response.toLowerCase();
-  return /\b(não tenho acesso|nao tenho acesso|aplique manualmente|você precisa aplicar|voce precisa aplicar|faça você mesmo|sem acesso direto|não é possível alterar|nao e possivel alterar|instruções para você|siga as instruções)\b/i.test(lower);
+  return /\b(aplique manualmente|você precisa aplicar|voce precisa aplicar|faça você mesmo|sem acesso direto|não é possível alterar|nao e possivel alterar|instruções para você|siga as instruções)\b/i.test(lower);
+}
+
+/**
+ * Modelo alegou não conseguir ler o projeto.
+ * Só trate como prematuro se o host já tiver workspace + memória prontos.
+ */
+export function claimsNoProjectAccess(response: string): boolean {
+  return /\b(não tenho acesso|nao tenho acesso|não posso analisar o projeto|nao posso analisar o projeto|sem acesso aos arquivos|não posso analisar diretamente|nao posso analisar diretamente|não tenho acesso aos arquivos|nao tenho acesso aos arquivos)\b/i.test(
+    response
+  );
 }
 
 export function isAgentImplementationTask(

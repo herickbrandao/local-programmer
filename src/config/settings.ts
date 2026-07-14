@@ -3,7 +3,7 @@ import * as vscode from 'vscode';
 export type PermissionMode = 'manual' | 'smart' | 'auto';
 export type OperationMode = 'chat' | 'analyze' | 'agent';
 
-export const READ_ONLY_TOOLS = ['read_file', 'list_files', 'search_files'] as const;
+export const READ_ONLY_TOOLS = ['read_file', 'read_files', 'list_files', 'search_files'] as const;
 export const WRITE_TOOLS = ['edit_file', 'modify_file', 'create_file', 'delete_file'] as const;
 export const RUN_TOOLS = ['run_command', 'test_project'] as const;
 export const IMPLEMENT_TOOLS = [...WRITE_TOOLS, 'test_project'] as const;

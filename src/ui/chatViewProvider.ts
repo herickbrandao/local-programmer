@@ -92,6 +92,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           case 'restore_file':
             await this.onRestoreFile(message.data);
             break;
+          case 'restore_checkpoint':
+            await this.onRestoreCheckpoint(message.data);
+            break;
           case 'index':
             await this.onIndex();
             break;
@@ -146,6 +149,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (wsRoot) {
       await this.snapshotManager.initialize(wsRoot);
       this.rollbackManager = new RollbackManager(this.snapshotManager, wsRoot);
+      await this.agent.refreshProjectMemory(true);
     }
 
     this.currentSession = await this.sessionManager.getOrCreateActiveSession();
@@ -316,6 +320,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.currentSession = await this.sessionManager.createSession();
     this.uiMessages = [...this.currentSession.uiMessages];
     this.agent.clearHistory();
+
+    const memStatus = await this.agent.refreshProjectMemory(true);
+    const memMsg: UiMessage = {
+      kind: 'system',
+      content: `💾 ${memStatus} — tools leem da RAM; alterações no disco atualizam a memória automaticamente.`,
+    };
+    this.uiMessages.push(memMsg);
+
     this.postMessage({
       type: 'load_session',
       session: this.currentSession,
@@ -424,11 +436,54 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       vscode.window.showInformationMessage(`Arquivo restaurado: ${data.file}`);
     }
 
+    await this.agent.refreshProjectMemory(false);
+
     this.pushUiMessage({
       kind: 'system',
       content: `↩ Arquivo restaurado: ${data.file}`,
     });
     this.postMessage({ type: 'ui_message', message: this.uiMessages[this.uiMessages.length - 1] });
+  }
+
+  private async onRestoreCheckpoint(data: {
+    versionId?: string;
+    files?: string[];
+  }): Promise<void> {
+    const versionId = data?.versionId;
+    if (!versionId || !this.rollbackManager) {
+      vscode.window.showWarningMessage('Checkpoint inválido ou histórico indisponível.');
+      return;
+    }
+
+    const files = Array.isArray(data.files) ? data.files : [];
+    const fileHint = files.length
+      ? `\n\nArquivos: ${files.slice(0, 12).join(', ')}${files.length > 12 ? '…' : ''}`
+      : '';
+
+    const confirm = await vscode.window.showWarningMessage(
+      `Restaurar todos os arquivos do checkpoint ${versionId} ao estado anterior?${fileHint}`,
+      { modal: true },
+      'Restaurar tudo'
+    );
+    if (confirm !== 'Restaurar tudo') {
+      return;
+    }
+
+    const ok = await this.rollbackManager.restoreVersion(versionId, { skipConfirm: true });
+    if (!ok) {
+      return;
+    }
+
+    await this.agent.refreshProjectMemory(true);
+
+    const msg: UiMessage = {
+      kind: 'system',
+      content: files.length
+        ? `↩ Checkpoint ${versionId} restaurado (${files.length} arquivo${files.length === 1 ? '' : 's'}).`
+        : `↩ Checkpoint ${versionId} restaurado.`,
+    };
+    this.pushUiMessage(msg);
+    this.postMessage({ type: 'ui_message', message: msg });
   }
 
   private async sendSettings(): Promise<void> {
@@ -492,6 +547,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   stopAgent(): void {
     this.agent.stop();
+  }
+
+  dispose(): void {
+    this.agent.dispose();
   }
 
   async refreshModeFromSettings(): Promise<void> {
@@ -724,7 +783,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           data: event.data as Record<string, unknown>,
         };
       case 'checkpoint':
-        return { kind: 'thinking', content: '💾 ' + event.content };
+        return {
+          id: createUiMessageId(),
+          kind: 'checkpoint',
+          content: event.content,
+          data: (event.data as Record<string, unknown> | undefined) ?? undefined,
+        };
       case 'cancelled':
         return { kind: 'system', content: '⏹ ' + event.content };
       case 'error':

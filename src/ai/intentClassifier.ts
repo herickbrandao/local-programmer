@@ -55,6 +55,17 @@ function fallbackByMode(operationMode: OperationMode): IntentClassification {
   return { intent: 'conversational', reason: 'Modo Chat — conversa', source: 'mode' };
 }
 
+/** Pedidos sobre o repo atual — nunca tratar como conversa vazia */
+export function looksLikeProjectTask(text: string): boolean {
+  return /projeto|c[oó]digo|arquivo|src\/|readme|perform|otimiz|lent|r[aá]pid|melhor(ar)?|analis|refator|bug|erro|implement|edit|atualiz|deix(e|ar)|verific|index|tool|agente|extens[aã]o/i.test(
+    text
+  );
+}
+
+function looksLikeProjectWrite(text: string): boolean {
+  return /alter|edit|melhor|otimiz|perform|implement|corrig|atualiz|deix|refator|acelera|reduz/i.test(text);
+}
+
 /**
  * A IA classifica o pedido. O modo da UI só impõe limites (Análise = nunca escrever).
  */
@@ -108,23 +119,42 @@ export async function classifyIntentWithAI(
 
     const parsed = parseIntentResponse(response.content);
     if (parsed) {
-      if (operationMode === 'chat' && parsed.intent === 'project_write') {
-        return { ...parsed, source: 'ai' };
+      let intent = parsed.intent;
+      let reason = parsed.reason;
+
+      if (intent === 'conversational' && looksLikeProjectTask(text)) {
+        intent = looksLikeProjectWrite(text) ? 'project_write' : 'project_read';
+        reason = reason || 'Pedido sobre o projeto — usando ferramentas';
       }
-      if (operationMode === 'agent' && parsed.intent === 'conversational') {
-        const hasProjectCue = /[@./\\]|\.(ts|js|md|json|py)\b|src\/|readme|arquivo|projeto|código|codigo/i.test(text);
-        if (hasProjectCue) {
-          return {
-            intent: 'project_read',
-            reason: parsed.reason || 'Pedido sobre o projeto — iniciando com leitura',
-            source: 'ai',
-          };
-        }
+
+      if (operationMode === 'agent' && intent === 'conversational' && looksLikeProjectTask(text)) {
+        intent = looksLikeProjectWrite(text) ? 'project_write' : 'project_read';
+        reason = reason || 'Modo Agente + pedido de projeto';
       }
-      return { ...parsed, source: 'ai' };
+
+      if (operationMode === 'chat' && intent === 'project_write') {
+        return { intent, reason, source: 'ai' };
+      }
+
+      return { intent, reason, source: 'ai' };
     }
   } catch {
     // fallback abaixo
+  }
+
+  if (looksLikeProjectTask(text)) {
+    if (operationMode === 'agent' || looksLikeProjectWrite(text)) {
+      return {
+        intent: 'project_write',
+        reason: 'Pedido de alteração/melhoria no projeto',
+        source: 'mode',
+      };
+    }
+    return {
+      intent: 'project_read',
+      reason: 'Pedido de análise do projeto',
+      source: 'mode',
+    };
   }
 
   return fallbackByMode(operationMode);

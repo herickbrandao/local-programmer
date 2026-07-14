@@ -9,8 +9,8 @@ import { validateEditWithinCitation } from './lineCitations';
 
 export type ExecutionPhase = 'explore' | 'implement';
 
-const IMPLEMENT_PHASE_READ_TOOLS = new Set(['read_file', 'search_files']);
-const READ_TOOL_NAMES = new Set(['read_file', 'list_files', 'search_files']);
+const IMPLEMENT_PHASE_READ_TOOLS = new Set(['read_file', 'read_files', 'search_files']);
+const READ_TOOL_NAMES = new Set(['read_file', 'read_files', 'list_files', 'search_files']);
 const WRITE_TOOL_NAMES = new Set<string>(WRITE_TOOLS);
 const IMPLEMENT_TOOL_NAMES = new Set<string>(IMPLEMENT_TOOLS);
 
@@ -118,7 +118,7 @@ export function buildMandatoryEditMessage(state: TaskState, userPrompt: string):
     ready.length > 1 ? `Arquivos aguardando edição: ${ready.join(', ')}` : '',
     buildConcreteEditHint(next ?? '', state.goal || userPrompt),
     '',
-    'read_file e search_files estão DESATIVADOS até salvar alterações.',
+    'read_file/read_files e search_files estão DESATIVADOS até salvar alterações.',
     'Chame edit_file replace_lines AGORA. Depois test_project.',
   ].filter(Boolean).join('\n');
 }
@@ -320,7 +320,11 @@ export function getToolBlockReason(
 
     const target = pickPrimaryEditTarget(state, state.goal);
 
-    if (toolName === 'read_file' && filePath && isFileFullyRead(state.fileReadCoverage, filePath)) {
+    if (
+      (toolName === 'read_file' || toolName === 'read_files')
+      && filePath
+      && isFileFullyRead(state.fileReadCoverage, filePath)
+    ) {
       if (!isNarrowVerificationRead(args)) {
         const pending = listFilesPendingRead(state, state.goal);
         return [
@@ -516,7 +520,7 @@ export function buildPhaseContextBlock(state: TaskState, toolsMode: string): str
     '',
     '## Exploração (leitura particionada — estilo Cursor)',
     'Arquivos grandes vêm em blocos de ~120 linhas — cite @arquivo:linhas quando possível.',
-    'Use read_file → continue_read=true ou start_line=N para o próximo trecho.',
+    'Vários arquivos: use read_files com paths:[...] numa única chamada.',
     'Leia só o necessário; depois edit_file + test_project.',
   ].join('\n');
 }
@@ -527,12 +531,24 @@ export function recordReadFile(state: TaskState, filePath: string): void {
   state.fileReadCounts[filePath] = (state.fileReadCounts[filePath] ?? 0) + 1;
 }
 
-export function recordReadTool(state: TaskState, toolName: string, filePath: string | undefined): void {
+export function recordReadTool(
+  state: TaskState,
+  toolName: string,
+  filePath: string | undefined,
+  batchPaths?: string[]
+): void {
   if (!READ_TOOL_NAMES.has(toolName)) {
     return;
   }
+  if (toolName === 'read_files' && batchPaths?.length) {
+    state.totalReads += 1;
+    for (const p of batchPaths) {
+      recordReadFile(state, p);
+    }
+    return;
+  }
   state.totalReads += 1;
-  if (toolName === 'read_file' && filePath) {
+  if ((toolName === 'read_file' || toolName === 'read_files') && filePath) {
     recordReadFile(state, filePath);
   }
 }

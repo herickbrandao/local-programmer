@@ -42,7 +42,14 @@ import {
   TaskState,
 } from './taskTracker';
 import { TokenTracker } from './tokenTracker';
-import { assessResponseQuality, buildRefinementPrompt, isAgentImplementationTask, isResponseTruncated, synthesizeFinalAnswer } from './responseValidator';
+import {
+  assessResponseQuality,
+  buildRefinementPrompt,
+  claimsNoProjectAccess,
+  isAgentImplementationTask,
+  isResponseTruncated,
+  synthesizeFinalAnswer,
+} from './responseValidator';
 import * as fs from 'fs/promises';
 import { recordReadRange, isFileFullyRead } from '../tools/fileReadChunks';
 import { normalizeToolArgs, resolveWorkspacePath } from '../tools/pathUtils';
@@ -52,6 +59,7 @@ import { AIProvider, AgentEvent,
   FileChange,
   PermissionRequest,
   PendingChange,
+  ToolCall,
 } from './types';
 import { ToolRegistry } from '../tools/toolRegistry';
 import { ToolContext, ToolResult } from '../tools/types';
@@ -59,6 +67,7 @@ import { PermissionManager } from '../permissions/permissionManager';
 import { SnapshotManager } from '../history/snapshotManager';
 import { DiffManager } from '../editor/diffManager';
 import { ContextManager } from '../workspace/contextManager';
+import { ProjectMemory } from '../workspace/projectMemory';
 import { attemptForcedEdit, buildEditSuccessMessage } from './editorFallback';
 import { runPlanDrivenPipeline, PlanRunnerResult } from './planDrivenRunner';
 import { mergeLineCitations, parseLineCitations } from './lineCitations';
@@ -69,6 +78,7 @@ import {
   EDIT_RESPONSE_TOKENS,
   trimChatMessagesForRequest,
 } from './contextBudget';
+import { formatPrefetchMessage, prefetchProjectContext } from './contextPrefetch';
 
 export class AgentController {
   private promptManager = new PromptManager();
@@ -77,6 +87,7 @@ export class AgentController {
   private snapshotManager = new SnapshotManager();
   private diffManager = new DiffManager();
   private contextManager = new ContextManager();
+  private projectMemory = new ProjectMemory();
   private providerRegistry = new ProviderRegistry();
   private messages: ChatMessage[] = [];
   private currentOperationMode: OperationMode = 'chat';
@@ -127,7 +138,31 @@ export class AgentController {
     await this.permissionManager.initialize(this.workspaceRoot);
     await this.snapshotManager.initialize(this.workspaceRoot);
     await this.contextManager.initialize(this.workspaceRoot);
+    await this.projectMemory.initialize(this.workspaceRoot);
     return true;
+  }
+
+  /** Recarrega espelho em RAM (novo chat / início de mensagem) */
+  async refreshProjectMemory(forceFull = false): Promise<string> {
+    if (!this.workspaceRoot) {
+      const ok = await this.initializeWorkspace();
+      if (!ok) {
+        return 'Sem workspace — memória não carregada.';
+      }
+    }
+    if (forceFull || !this.projectMemory.isReady()) {
+      const stats = await this.projectMemory.reloadAll();
+      return `Memória atualizada: ${stats.files} arquivos (~${(stats.bytes / (1024 * 1024)).toFixed(2)} MB)`;
+    }
+    return this.projectMemory.formatStatus();
+  }
+
+  getProjectMemory(): ProjectMemory {
+    return this.projectMemory;
+  }
+
+  dispose(): void {
+    this.projectMemory.dispose();
   }
 
   async getModels(): Promise<string[]> {
@@ -210,13 +245,13 @@ export class AgentController {
         this.abortController?.signal
       );
       this.throwIfAborted();
-      const effectiveIntent = classification.intent;
 
       let allowWriteOverride = false;
-      if (mode === 'chat' && effectiveIntent === 'project_write') {
+      if (mode === 'chat' && classification.intent === 'project_write') {
         allowWriteOverride = await this.confirmWriteAction(userPrompt);
       }
-      const resolved = resolveMessageMode(mode, effectiveIntent, allowWriteOverride);
+      const resolved = resolveMessageMode(mode, classification.intent, allowWriteOverride);
+      const effectiveIntent = resolved.intent;
 
       const needsWorkspace = resolved.useTools && resolved.toolsMode !== 'chat';
       if (needsWorkspace && !this.workspaceRoot) {
@@ -243,6 +278,15 @@ export class AgentController {
           ? await this.contextManager.getLeanProjectContext(this.workspaceRoot)
           : await this.contextManager.getProjectContext(this.workspaceRoot))
         : undefined;
+      if (this.workspaceRoot && resolved.useTools) {
+        await this.refreshProjectMemory(false);
+        const memStatus = this.projectMemory.formatStatus();
+        if (memStatus) {
+          projectContext = projectContext
+            ? `${projectContext}\n\n## Memória RAM do projeto\n${memStatus}\nAs tools (read_files/read_file) leem daqui primeiro; se o arquivo não estiver na RAM, leem do disco.`
+            : `## Memória RAM do projeto\n${memStatus}`;
+        }
+      }
       if (this.workspaceRoot) {
         const rules = await loadProjectRules(this.workspaceRoot);
         if (rules) {
@@ -276,10 +320,10 @@ export class AgentController {
 
       this.refreshSystemPrompt(mode, taskState, projectContext, effectiveIntent, resolved.toolsMode);
 
-      if (mode === 'chat' && effectiveIntent === 'project_write' && !allowWriteOverride) {
+      if (mode === 'chat' && classification.intent === 'project_write' && !allowWriteOverride) {
         this.emit({
           type: 'thinking',
-          content: 'Modo Chat — vou orientar em texto. Para executar alterações, confirme quando solicitado.',
+          content: 'Modo Chat — analisando o projeto com ferramentas (leitura). Para aplicar alterações, confirme quando solicitado.',
         });
       } else if (resolved.useTools && effectiveIntent !== 'conversational') {
         this.emit({
@@ -290,12 +334,40 @@ export class AgentController {
 
       this.messages.push({ role: 'user', content: userPrompt });
 
+      if (
+        this.workspaceRoot
+        && resolved.useTools
+        && effectiveIntent !== 'conversational'
+        && !taskState.citedRanges?.length
+      ) {
+        this.emit({ type: 'thinking', content: 'Pré-carregando arquivos relevantes em lote...' });
+        await this.refreshProjectMemory(false);
+        const prefetch = await prefetchProjectContext(
+          this.workspaceRoot,
+          displayPrompt ?? userPrompt,
+          taskState,
+          this.projectMemory
+        );
+        if (prefetch.applied) {
+          this.messages.push({
+            role: 'user',
+            content: formatPrefetchMessage(prefetch),
+            internal: true,
+          });
+          this.emit({
+            type: 'thinking',
+            content: `Lote pronto: ${prefetch.paths.length} arquivo(s) — ${prefetch.paths.join(', ')}`,
+          });
+        }
+      }
+
       const pendingChanges: PendingChange[] = [];
       const sessionChanges: FileChange[] = [];
       const iterationGuard = new IterationGuard();
       let stoppedEarly = false;
       let validationAttempts = 0;
       let forceTextOnly = false;
+      let accessDenialRetries = 0;
       const partialResponses: string[] = [];
       const maxValidationAttempts = 2;
       const displayQuestion = displayPrompt ?? userPrompt;
@@ -458,7 +530,8 @@ export class AgentController {
           let iterationHadBlockedRead = false;
           let lastFullyReadFile: string | undefined;
 
-          for (const toolCall of response.toolCalls) {
+          const toolCalls = this.coalesceReadToolCalls(response.toolCalls);
+          for (const toolCall of toolCalls) {
             if (!this.promptManager.isToolAllowed(resolved.toolsMode, toolCall.name, effectiveIntent)) {
               const blocked = `Ferramenta "${toolCall.name}" requer confirmação ou modo Agente.`;
               this.emit({ type: 'tool_result', content: blocked, data: { success: false } });
@@ -506,7 +579,11 @@ export class AgentController {
               effectiveIntent
             );
             if (blockReason) {
-              if (toolCall.name === 'read_file' || toolCall.name === 'search_files') {
+              if (
+                toolCall.name === 'read_file'
+                || toolCall.name === 'read_files'
+                || toolCall.name === 'search_files'
+              ) {
                 iterationHadBlockedRead = true;
               }
               this.emit({ type: 'tool_result', content: blockReason, data: { success: false } });
@@ -584,12 +661,13 @@ export class AgentController {
             if (result.success) {
               iterationHadSuccess = true;
               const isWrite = ['edit_file', 'modify_file', 'create_file', 'delete_file'].includes(toolCall.name);
-              const isRead = ['read_file', 'list_files', 'search_files'].includes(toolCall.name);
+              const isRead = ['read_file', 'read_files', 'list_files', 'search_files'].includes(toolCall.name);
               if (isWrite) {
                 iterationHadWrite = true;
               } else if (isRead) {
                 iterationHadReadOnly = true;
-                recordReadTool(taskState, toolCall.name, filePath);
+                const batchPaths = (result.data as { paths?: string[] } | undefined)?.paths;
+                recordReadTool(taskState, toolCall.name, filePath, batchPaths);
               }
 
               const data = result.data as { path?: string; newContent?: string; content?: string } | undefined;
@@ -601,9 +679,12 @@ export class AgentController {
               }
             }
 
-            if (result.success && toolCall.name === 'read_file' && filePath) {
+            if (
+              result.success
+              && (toolCall.name === 'read_file' || toolCall.name === 'read_files')
+            ) {
               updateExecutionPhase(taskState, resolved.toolsMode);
-              if (isFileFullyRead(taskState.fileReadCoverage, filePath)) {
+              if (filePath && isFileFullyRead(taskState.fileReadCoverage, filePath)) {
                 lastFullyReadFile = filePath;
               }
             }
@@ -893,6 +974,52 @@ export class AgentController {
             break;
           }
 
+          if (
+            resolved.useTools
+            && effectiveIntent !== 'conversational'
+            && this.workspaceRoot
+            && claimsNoProjectAccess(response.content)
+            && accessDenialRetries < 1
+          ) {
+            // Workspace + RAM prontos: a negação foi prematura — injeta leitura real e pede nova resposta
+            accessDenialRetries += 1;
+            if (response.content.trim()) {
+              this.messages.push({ role: 'assistant', content: response.content });
+            }
+            await this.refreshProjectMemory(false);
+            const prefetch = await prefetchProjectContext(
+              this.workspaceRoot,
+              displayQuestion,
+              taskState,
+              this.projectMemory
+            );
+            if (prefetch.applied) {
+              this.messages.push({
+                role: 'user',
+                content: formatPrefetchMessage(prefetch),
+                internal: true,
+              });
+            }
+            this.messages.push({
+              role: 'user',
+              content: [
+                '[Leitura do host]',
+                `Memória: ${this.projectMemory.formatStatus()}.`,
+                prefetch.applied
+                  ? 'Trechos acima já foram lidos da RAM/disco. Continue a análise com base neles (caminhos + linhas).'
+                  : 'Chame read_files com paths concretos do projeto e analise o retorno.',
+                'Só diga falta de acesso se alguma leitura específica falhar.',
+              ].join('\n'),
+              internal: true,
+            });
+            forceTextOnly = false;
+            this.emit({
+              type: 'thinking',
+              content: 'Lendo arquivos da memória RAM para continuar a análise...',
+            });
+            continue;
+          }
+
           if (decomposition.decomposed) {
             const summary = response.content.trim() || '(etapa concluída)';
             completedSubtaskNotes.push(summary.slice(0, 600));
@@ -1019,7 +1146,7 @@ export class AgentController {
 
           if (approvedChanges.length > 0) {
             this.emit({
-              type: 'checkpoint',
+              type: 'thinking',
               content: `Criando checkpoint com ${approvedChanges.length} alterações...`,
             });
 
@@ -1031,10 +1158,11 @@ export class AgentController {
             );
             this.lastVersionId = manifest.id;
             this.emitVersionedChanges(approvedChanges, manifest.id);
+            this.emitCheckpointCard(manifest, approvedChanges, userPrompt);
           }
         } else {
           this.emit({
-            type: 'checkpoint',
+            type: 'thinking',
             content: `Criando checkpoint: .ai-history/${this.snapshotManager.getLatestVersionId() ?? 'nova versão'}`,
           });
 
@@ -1046,6 +1174,7 @@ export class AgentController {
           );
           this.lastVersionId = manifest.id;
           this.emitVersionedChanges(sessionChanges, manifest.id);
+          this.emitCheckpointCard(manifest, sessionChanges, userPrompt);
         }
       }
 
@@ -1268,6 +1397,51 @@ export class AgentController {
     return false;
   }
 
+  /** Junta vários read_file numa única read_files — 1 ida ao modelo em vez de N */
+  private coalesceReadToolCalls(toolCalls: ToolCall[]): ToolCall[] {
+    const reads = toolCalls.filter((t) => t.name === 'read_file' || t.name === 'read_files');
+    const rest = toolCalls.filter((t) => t.name !== 'read_file' && t.name !== 'read_files');
+    if (reads.length <= 1) {
+      return toolCalls;
+    }
+
+    const paths: string[] = [];
+    for (const call of reads) {
+      const args = call.arguments ?? {};
+      if (Array.isArray(args.paths)) {
+        paths.push(...args.paths.map(String));
+      } else if (typeof args.path === 'string' && args.path) {
+        paths.push(args.path);
+      }
+      if (Array.isArray(args.files)) {
+        for (const f of args.files) {
+          if (f && typeof f === 'object' && 'path' in f) {
+            paths.push(String((f as { path: string }).path));
+          }
+        }
+      }
+    }
+
+    const unique = [...new Set(paths.map((p) => p.replace(/\\/g, '/')).filter(Boolean))];
+    if (unique.length === 0) {
+      return toolCalls;
+    }
+
+    this.emit({
+      type: 'thinking',
+      content: `Lendo ${unique.length} arquivos em lote (paralelo no disco)...`,
+    });
+
+    return [
+      {
+        id: `batch_read_${Date.now()}`,
+        name: 'read_files',
+        arguments: { paths: unique, max_lines_per_file: 80 },
+      },
+      ...rest,
+    ];
+  }
+
   private refreshSystemPrompt(
     mode: OperationMode,
     taskState: TaskState,
@@ -1323,31 +1497,72 @@ export class AgentController {
     const context: ToolContext = {
       workspaceRoot: this.workspaceRoot,
       fileReadCoverage: taskState?.fileReadCoverage,
+      projectMemory: this.projectMemory,
     };
     const result = await tool.execute(args, context);
 
-    if (toolName === 'read_file' && result.success && taskState && result.data) {
+    // Mantém RAM sincronizada após escrita do agente
+    if (result.success && result.data) {
+      const written = result.data as {
+        path?: string;
+        newContent?: string;
+        content?: string;
+        action?: string;
+      };
+      if (written.path && (toolName === 'edit_file' || toolName === 'modify_file' || toolName === 'create_file')) {
+        const text = written.newContent ?? written.content;
+        if (typeof text === 'string') {
+          this.projectMemory.setContent(written.path, text);
+        } else {
+          void this.projectMemory.refreshFile(written.path);
+        }
+      }
+      if (toolName === 'delete_file' && written.path) {
+        this.projectMemory.delete(written.path);
+      }
+    }
+
+    if (
+      (toolName === 'read_file' || toolName === 'read_files')
+      && result.success
+      && taskState
+      && result.data
+    ) {
       const readData = result.data as {
         path?: string;
         startLine?: number;
         endLine?: number;
         totalLines?: number;
         duplicate?: boolean;
+        batch?: boolean;
+        files?: Array<{
+          path?: string;
+          startLine?: number;
+          endLine?: number;
+          totalLines?: number;
+        }>;
       };
-      if (
-        readData.path
-        && readData.startLine
-        && readData.endLine
-        && readData.totalLines
-        && !readData.duplicate
-      ) {
-        recordReadRange(
-          taskState.fileReadCoverage,
-          readData.path,
-          readData.startLine,
-          readData.endLine,
-          readData.totalLines
-        );
+
+      const ranges = readData.batch && readData.files?.length
+        ? readData.files
+        : [readData];
+
+      for (const entry of ranges) {
+        if (
+          entry.path
+          && entry.startLine
+          && entry.endLine
+          && entry.totalLines
+          && !readData.duplicate
+        ) {
+          recordReadRange(
+            taskState.fileReadCoverage,
+            entry.path,
+            entry.startLine,
+            entry.endLine,
+            entry.totalLines
+          );
+        }
       }
     }
 
@@ -1414,6 +1629,7 @@ export class AgentController {
 
     const actionMap: Record<string, string> = {
       read_file: 'Ler arquivo',
+      read_files: 'Ler arquivos (lote)',
       edit_file: 'Editar arquivo (cirúrgico)',
       modify_file: 'Modificar arquivo',
       create_file: 'Criar arquivo',
@@ -1477,6 +1693,24 @@ export class AgentController {
         },
       });
     }
+  }
+
+  private emitCheckpointCard(
+    manifest: { id: string; date: string },
+    changes: FileChange[],
+    userPrompt: string
+  ): void {
+    const files = [...new Set(changes.map((c) => c.file))];
+    this.emit({
+      type: 'checkpoint',
+      content: `Checkpoint ${manifest.id}`,
+      data: {
+        versionId: manifest.id,
+        date: manifest.date,
+        files,
+        prompt: userPrompt.slice(0, 160),
+      },
+    });
   }
 
   getSnapshotManager(): SnapshotManager {

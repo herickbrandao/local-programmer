@@ -47,11 +47,12 @@ export function resolveMessageMode(
       };
     }
     if (operationMode === 'chat') {
+      // Sem confirmação de escrita: ainda assim lê o projeto (não inventar "sem acesso")
       return {
-        intent,
-        toolsMode: 'chat',
-        useTools: false,
-        showIterations: false,
+        intent: 'project_read',
+        toolsMode: 'analyze',
+        useTools: true,
+        showIterations: true,
       };
     }
     return {

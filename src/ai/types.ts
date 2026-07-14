@@ -3,6 +3,7 @@ export interface ChatMessage {
   content: string;
   toolCallId?: string;
   name?: string;
+  /** Se true, a UI pode ocultar; o request ao modelo AINDA inclui a mensagem */
   internal?: boolean;
 }
 

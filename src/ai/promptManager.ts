@@ -11,18 +11,47 @@ export interface SystemPromptOptions {
 
 const ALL_TOOLS: ToolDefinition[] = [
   {
+    name: 'read_files',
+    description:
+      'Lê VÁRIOS arquivos de uma vez (recomendado). Evita várias rodadas. paths: ["a.ts","b.ts"]',
+    parameters: {
+      type: 'object',
+      properties: {
+        paths: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Lista de caminhos relativos (máx. 8)',
+        },
+        files: {
+          type: 'array',
+          description: 'Alternativa: [{path, start_line?, end_line?}]',
+          items: { type: 'object' },
+        },
+        max_lines_per_file: {
+          type: 'number',
+          description: 'Linhas por arquivo (padrão 80)',
+        },
+      },
+    },
+  },
+  {
     name: 'read_file',
-    description: 'Lê arquivo em trechos (~120 linhas). Prefira start_line/end_line no trecho alvo.',
+    description:
+      'Lê UM arquivo/trecho. Para vários: use read_files ou paths:["a.ts","b.ts"].',
     parameters: {
       type: 'object',
       properties: {
         path: { type: 'string', description: 'Caminho relativo do arquivo' },
+        paths: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Lote opcional — lê vários arquivos numa chamada',
+        },
         start_line: { type: 'number', description: 'Linha inicial (1-based). Para trecho específico ou busca por linha.' },
         end_line: { type: 'number', description: 'Linha final inclusive (opcional)' },
         continue_read: { type: 'boolean', description: 'true = próximo bloco após o último lido deste arquivo' },
         chunk_size: { type: 'number', description: 'Tamanho do bloco em linhas (padrão 120)' },
       },
-      required: ['path'],
     },
   },
   {
@@ -147,40 +176,54 @@ export class PromptManager {
     const phase = options?.phase;
     const toolsMode = options?.toolsMode ?? mode;
 
+    const accessBlock = [
+      '',
+      '## Como ler o projeto',
+      '- Com pasta aberta: use read_files / read_file / search_files / list_files (leem a memória RAM do host e, se precisar, o disco).',
+      '- Se já houver trechos pré-carregados na conversa, analise com base neles antes de pedir mais leitura.',
+      '- Só diga que não tem acesso quando for verdade: sem workspace, arquivo fora do projeto, ou a tool retornou erro/ausência.',
+      '- Não invente conteúdo nem peça ao usuário para abrir arquivos que você ainda não tentou ler.',
+    ].join('\n');
+
     if (toolsMode === 'agent' && intent === 'project_write') {
       return this.buildAgentWritePrompt(contextSection, taskSection, phase);
     }
 
-    if (mode === 'chat') {
+    // Importante: usar toolsMode (efetivo), NÃO o modo da UI — Chat+pedido de projeto vira analyze com tools
+    if (toolsMode === 'chat') {
       return `Você é um assistente de programação local integrado ao VSCode, rodando via Ollama.
 
 ## Modo atual: CHAT (conversa)
 - Responda em português brasileiro, de forma natural e amigável
 - Para cumprimentos, conversa casual e dúvidas conceituais, responda diretamente em texto — sem ferramentas
-- Se o usuário pedir para ler ou alterar arquivos, explique o que faria e informe que a aplicação pedirá confirmação antes de executar
+- Se houver contexto de projeto abaixo, use-o; só diga falta de acesso se realmente não houver pasta/arquivo
+- Se o usuário pedir para alterar arquivos, explique o que faria e informe que a aplicação pedirá confirmação
 - Não recuse ajudar: oriente o usuário e responda o que puder em texto
 - Seja conciso, claro e prestativo
 ${contextSection}${taskSection}`;
     }
 
-    if (mode === 'analyze') {
+    if (toolsMode === 'analyze') {
       return `Você é um analista de código local integrado ao VSCode.
 
-## Modo atual: ANÁLISE (prioridade leitura)
-- Use ferramentas SOMENTE quando o usuário pedir algo relacionado ao projeto (ler, buscar, analisar arquivos)
-- Para cumprimentos, conversa casual ou perguntas gerais, responda em texto — NÃO liste arquivos nem explore o projeto
-- Você PODE ler arquivos, listar pastas e buscar no código quando relevante
-- Alterações em arquivos exigem aprovação do usuário — se pedirem edição, execute com a ferramenta adequada após explicar
-- Analise o projeto e responda com insights, explicações, revisões e sugestões em texto
-- Nunca explore o projeto "por curiosidade" — só use ferramentas com propósito claro
+## Modo atual: ANÁLISE (leitura + tools)
+- O usuário pediu algo sobre ESTE projeto — você DEVE usar ferramentas ou o contexto pré-carregado
+- Para cumprimentos/casual sem relação ao repo: responda em texto
+- Você PODE e DEVE ler arquivos, listar pastas e buscar no código
+- Responda com insights concretos citados de arquivos reais (caminhos + linhas)
 - Responda em português brasileiro
+${accessBlock}
 
 ## Ferramentas disponíveis (somente leitura)
-- read_file, list_files, search_files
+- read_files (preferido para vários arquivos), read_file, list_files, search_files
+
+## Leitura eficiente
+- Para 2+ arquivos: UMA chamada read_files com paths:["a.ts","b.ts"] — NÃO leia um por iteração
+- Se o contexto já veio pré-carregado, use-o; se faltar detalhe, chame read_files de novo
 
 ## Formato de chamada de ferramenta
 \`\`\`json
-{ "tool_calls": [{ "name": "read_file", "arguments": { "path": "src/app.ts" } }] }
+{ "tool_calls": [{ "name": "read_files", "arguments": { "paths": ["src/a.ts", "src/b.ts"] } }] }
 \`\`\`
 
 Após coletar informações, responda com a análise completa em texto.
@@ -215,7 +258,11 @@ Ao chamar create_file ou modify_file, o JSON deve ser válido:
 - NUNCA deixe aspas duplas soltas dentro do valor de "content"
 
 ## Ferramentas Disponíveis
-- read_file, modify_file, create_file, delete_file, run_command, list_files, search_files
+- read_files (lote), read_file, modify_file, create_file, delete_file, run_command, list_files, search_files
+
+## Leitura eficiente
+- Nunca leia arquivo por arquivo em iterações separadas se puder usar read_files
+- Prefira paths em lote; edite em seguida com edit_file replace_lines
 
 ## Formato de Chamada de Ferramenta
 Use EXATAMENTE um destes formatos JSON:
@@ -242,12 +289,13 @@ ${contextSection}${taskSection}`;
 ## FASE ATUAL: IMPLEMENTAÇÃO
 - Leitura ampla ENCERRADA — não use read_file sem start_line/end_line
 - **search_files** permitido para achar linha (ex: nome de função ou classe CSS)
-- **read_file** permitido: trecho ≤120 linhas não lido OU ≤30 linhas para reverificar
+- **read_files/read_file** permitido: trecho ≤120 linhas não lido OU ≤30 linhas para reverificar
 - Use **edit_file replace_lines** — NUNCA reescreva o arquivo inteiro
 - Depois de editar, chame **test_project** para validar`
       : `
 ## Fase: EXPLORAÇÃO
-- Leia trechos com read_file (use start_line/end_line em arquivos grandes)
+- Para vários arquivos: UMA chamada **read_files** com paths:[...] — nunca um por iteração
+- Se o contexto já veio pré-carregado, NÃO releia os mesmos arquivos
 - Depois edite com **edit_file** — mudanças mínimas e precisas
 - Valide com **test_project** quando terminar`;
 
@@ -258,6 +306,7 @@ Você é um **editor de código** — o pedido do usuário DEVE resultar em alte
 O sistema primeiro gera um **plano em etapas** (várias alterações em linhas diferentes); depois executa e verifica.
 Se o plano automático falhar, continue manualmente com edit_file em trechos pequenos.
 Nunca encerre só com texto se o pedido pedia mudança no código.
+Com pasta aberta, leia via tools (RAM/disco) antes de concluir; só declare falta de acesso se a leitura falhar de verdade.
 
 ## Fluxo recomendado (estilo Cursor/Codex)
 1. **read_file** — trecho alvo (automático ~120 linhas; better: @arquivo:linhas)

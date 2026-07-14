@@ -108,7 +108,7 @@ export class ContextManager {
       `Arquivos: ${map.totalFiles}`,
       'Arquivos importantes:',
       importantFiles.join('\n'),
-      '(Contexto enxuto — use read_file no trecho alvo; não explore o projeto inteiro.)',
+      '(Contexto enxuto — arquivos do projeto estão em memória RAM; use read_files/search_files.)',
     ].join('\n');
   }
 

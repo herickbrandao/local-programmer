@@ -94,6 +94,31 @@ export class SearchFilesTool implements Tool {
     const queries = buildSearchQueries(rawQuery);
 
     try {
+      // Preferir memória RAM (projeto inteiro já carregado)
+      if (context.projectMemory?.isReady()) {
+        const memHits: string[] = [];
+        for (const q of queries) {
+          for (const hit of context.projectMemory.search(q, MAX_RESULTS)) {
+            if (!memHits.includes(hit)) {
+              memHits.push(hit);
+            }
+            if (memHits.length >= MAX_RESULTS) {
+              break;
+            }
+          }
+          if (memHits.length >= MAX_RESULTS) {
+            break;
+          }
+        }
+        if (memHits.length > 0) {
+          return {
+            success: true,
+            output: `${memHits.length} resultado(s) (memória RAM):\n${memHits.join('\n')}`,
+            data: { results: memHits, source: 'memory' },
+          };
+        }
+      }
+
       const searchPattern = path
         .join(context.workspaceRoot, normalizeSearchPattern(filePattern))
         .replace(/\\/g, '/');
@@ -141,7 +166,7 @@ export class SearchFilesTool implements Tool {
       return {
         success: true,
         output: `${results.length} resultado(s):\n${output}`,
-        data: { results },
+        data: { results, source: 'disk' },
       };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);

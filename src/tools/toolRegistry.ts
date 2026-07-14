@@ -7,12 +7,14 @@ import { CreateFileTool } from './createFile';
 import { DeleteFileTool } from './deleteFile';
 import { RunCommandTool } from './runCommand';
 import { ListFilesTool, SearchFilesTool } from './listFiles';
+import { ReadFilesTool } from './readFiles';
 
 export class ToolRegistry {
   private tools = new Map<string, Tool>();
 
   constructor() {
     this.register(new ReadFileTool());
+    this.register(new ReadFilesTool());
     this.register(new EditFileTool());
     this.register(new ModifyFileTool());
     this.register(new CreateFileTool());

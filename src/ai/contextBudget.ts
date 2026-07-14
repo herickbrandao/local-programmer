@@ -14,6 +14,9 @@ const MAX_MSG_CHARS = 6000;
 /**
  * Reduz o histórico enviado ao modelo: mantém system + últimas mensagens,
  * trunca tool results enormes (maior custo de prefill no Ollama).
+ *
+ * IMPORTANTE: mensagens `internal` (prefetch, continuações, correções) DEVEM
+ * ir para o modelo — `internal` só esconde na UI, não no request.
  */
 export function trimChatMessagesForRequest(
   messages: ChatMessage[],
@@ -21,7 +24,7 @@ export function trimChatMessagesForRequest(
   intent: MessageIntent
 ): ChatMessage[] {
   const system = messages.find((m) => m.role === 'system');
-  const rest = messages.filter((m) => m.role !== 'system' && !m.internal);
+  const rest = messages.filter((m) => m.role !== 'system');
 
   const maxRest = phase === 'implement' || intent === 'project_write' ? 14 : 28;
   const sliced = rest.slice(-maxRest);

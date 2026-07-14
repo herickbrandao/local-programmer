@@ -7,11 +7,12 @@ import { getExtensionSettings, OperationMode, updateExtensionSettings } from './
 
 let snapshotManager: SnapshotManager;
 let rollbackManager: RollbackManager;
+let chatProvider: ChatViewProvider;
 
 const OPERATION_MODES: OperationMode[] = ['chat', 'analyze', 'agent'];
 
 export function activate(context: vscode.ExtensionContext): void {
-  const chatProvider = new ChatViewProvider(context.extensionUri, context);
+  chatProvider = new ChatViewProvider(context.extensionUri, context);
 
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(
@@ -126,5 +127,5 @@ export function activate(context: vscode.ExtensionContext): void {
 }
 
 export function deactivate(): void {
-  // cleanup handled by subscriptions
+  chatProvider?.dispose();
 }

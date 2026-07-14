@@ -5,7 +5,7 @@ import { ChatMessage } from '../ai/types';
 
 export interface UiMessage {
   id?: string;
-  kind: 'user' | 'assistant' | 'system' | 'tool' | 'thinking' | 'error' | 'file_change';
+  kind: 'user' | 'assistant' | 'system' | 'tool' | 'thinking' | 'error' | 'file_change' | 'checkpoint';
   content: string;
   data?: Record<string, unknown>;
 }

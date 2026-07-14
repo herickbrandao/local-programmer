@@ -8,15 +8,21 @@ import {
 } from './fileReadChunks';
 import { normalizeWorkspacePath, resolveWorkspacePath } from './pathUtils';
 import { Tool, ToolContext, ToolResult } from './types';
+import { ReadFilesTool } from './readFiles';
 
 export class ReadFileTool implements Tool {
   name = 'read_file';
-  description = 'Lê arquivo ou trecho (particionado em arquivos grandes)';
+  description =
+    'Lê arquivo ou trecho. Para vários arquivos, use paths:["a.ts","b.ts"] (lote) ou a tool read_files.';
 
   async execute(args: Record<string, unknown>, context: ToolContext): Promise<ToolResult> {
+    if (Array.isArray(args.paths) && args.paths.length > 0) {
+      return new ReadFilesTool().execute(args, context);
+    }
+
     const rawPath = args.path as string;
     if (!rawPath) {
-      return { success: false, output: 'Parâmetro "path" é obrigatório' };
+      return { success: false, output: 'Parâmetro "path" (ou paths[]) é obrigatório' };
     }
 
     const filePath = normalizeWorkspacePath(context.workspaceRoot, rawPath);
@@ -30,7 +36,8 @@ export class ReadFileTool implements Tool {
     const fileCoverage = context.fileReadCoverage?.[filePath];
 
     try {
-      const content = await fs.readFile(fullPath, 'utf-8');
+      const cached = context.projectMemory?.get(filePath);
+      const content = cached?.content ?? await fs.readFile(fullPath, 'utf-8');
       const allLines = content.split('\n');
       const totalLines = allLines.length;
 

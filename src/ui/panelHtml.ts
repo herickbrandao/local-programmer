@@ -226,6 +226,24 @@ export function getPanelHtml(): string {
       max-height: 150px;
     }
     textarea:focus { outline: 1px solid var(--vscode-focusBorder); }
+    /* Continua-like: composer brilha enquanto o agente trabalha */
+    .input-wrapper.working textarea {
+      outline: none;
+      border-color: color-mix(in srgb, var(--vscode-focusBorder) 70%, transparent);
+      animation: composer-glow 1.8s ease-in-out infinite;
+    }
+    @keyframes composer-glow {
+      0%, 100% {
+        box-shadow:
+          0 0 0 1px color-mix(in srgb, var(--vscode-focusBorder) 55%, transparent),
+          0 0 10px color-mix(in srgb, var(--vscode-focusBorder) 35%, transparent);
+      }
+      50% {
+        box-shadow:
+          0 0 0 2px var(--vscode-focusBorder),
+          0 0 18px color-mix(in srgb, var(--vscode-button-background) 45%, transparent);
+      }
+    }
     .send-btn, .stop-btn {
       align-self: flex-end;
       padding: 8px 16px;
@@ -242,7 +260,10 @@ export function getPanelHtml(): string {
       display: none;
       background: var(--vscode-errorForeground);
       color: var(--vscode-editor-background);
+      white-space: nowrap;
     }
+    .input-wrapper.working .stop-btn { display: inline-block; }
+    .input-wrapper.working .send-btn { display: none; }
     .stop-btn:hover { opacity: 0.9; }
     /* Wrapper evita bug do webview: summary com display:flex colapsa altura → some do chat */
     .activity-wrap {
@@ -471,6 +492,34 @@ export function getPanelHtml(): string {
     .action-btn:hover { background: var(--vscode-toolbar-hoverBackground); }
     .action-btn.compare { border-color: var(--vscode-textLink-foreground); color: var(--vscode-textLink-foreground); }
     .action-btn.restore { border-color: var(--vscode-inputValidation-warningBorder, #cca700); }
+    .message.checkpoint-card {
+      align-self: stretch;
+      background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
+      border: 1px solid var(--vscode-panel-border);
+      border-left: 3px solid var(--vscode-charts-green, #89d185);
+      border-radius: 6px;
+      padding: 10px 12px;
+      max-width: 100%;
+    }
+    .checkpoint-label {
+      font-size: 11px;
+      color: var(--vscode-descriptionForeground);
+      margin-bottom: 4px;
+    }
+    .checkpoint-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--vscode-foreground);
+      margin-bottom: 6px;
+    }
+    .checkpoint-files {
+      font-size: 11px;
+      color: var(--vscode-descriptionForeground);
+      margin-bottom: 8px;
+      line-height: 1.45;
+      word-break: break-word;
+    }
+    .checkpoint-actions { display: flex; gap: 8px; flex-wrap: wrap; }
     .cite-chip {
       display: inline-flex;
       align-items: center;
@@ -956,7 +1005,10 @@ export function getPanelHtml(): string {
       const preview = String(content).replace(/\\s+/g, ' ').trim();
       if (meta) meta.textContent = state.activity.count + ' passo' + (state.activity.count === 1 ? '' : 's');
       if (title) title.textContent = preview.length > 72 ? preview.slice(0, 69) + '…' : preview;
-      state.activity.el.open = false;
+      // Não forçar fechar: se o usuário abriu o accordion, permanece aberto ao chegar novo passo
+      if (state.activity.el.open) {
+        state.activity.body.scrollTop = state.activity.body.scrollHeight;
+      }
       els.messages.scrollTop = els.messages.scrollHeight;
     }
 
@@ -1025,6 +1077,10 @@ export function getPanelHtml(): string {
           sealActivityAccordion();
           addFileChangeCard(msg.data);
           break;
+        case 'checkpoint':
+          sealActivityAccordion();
+          addCheckpointCard(msg.data || {}, msg.content);
+          break;
       }
     }
 
@@ -1036,6 +1092,58 @@ export function getPanelHtml(): string {
       clearStreamingMessage();
       (messages || []).forEach(renderUiMessage);
       sealActivityAccordion();
+    }
+
+    function addCheckpointCard(data, fallbackContent) {
+      const versionId = data?.versionId;
+      if (!versionId) {
+        if (fallbackContent) addMessage(fallbackContent, 'system');
+        return;
+      }
+
+      const files = Array.isArray(data.files) ? data.files.filter(Boolean) : [];
+      const div = document.createElement('div');
+      div.className = 'message checkpoint-card';
+      div.dataset.versionId = versionId;
+
+      const label = document.createElement('div');
+      label.className = 'checkpoint-label';
+      label.textContent = '💾 Checkpoint';
+
+      const title = document.createElement('div');
+      title.className = 'checkpoint-title';
+      title.textContent = versionId + (files.length
+        ? (' · ' + files.length + ' arquivo' + (files.length === 1 ? '' : 's'))
+        : '');
+
+      const fileList = document.createElement('div');
+      fileList.className = 'checkpoint-files';
+      fileList.textContent = files.length
+        ? files.join(', ')
+        : 'Restaura todos os arquivos deste lote ao estado anterior.';
+
+      const actions = document.createElement('div');
+      actions.className = 'checkpoint-actions';
+
+      const restoreBtn = document.createElement('button');
+      restoreBtn.className = 'action-btn restore';
+      restoreBtn.type = 'button';
+      restoreBtn.textContent = 'Restaurar tudo';
+      restoreBtn.title = 'Voltar todos os arquivos deste checkpoint ao estado anterior';
+      restoreBtn.addEventListener('click', () => {
+        vscode.postMessage({
+          type: 'restore_checkpoint',
+          data: { versionId, files },
+        });
+      });
+
+      actions.appendChild(restoreBtn);
+      div.appendChild(label);
+      div.appendChild(title);
+      div.appendChild(fileList);
+      div.appendChild(actions);
+      els.messages.appendChild(div);
+      els.messages.scrollTop = els.messages.scrollHeight;
     }
 
     function addFileChangeCard(data) {
@@ -1442,10 +1550,11 @@ export function getPanelHtml(): string {
     function setProcessing(processing) {
       state.isProcessing = processing;
       els.sendBtn.disabled = processing;
-      els.sendBtn.style.display = processing ? 'none' : '';
-      if (els.stopBtn) {
-        els.stopBtn.style.display = processing ? '' : 'none';
+      const wrapper = els.promptInput?.closest('.input-wrapper');
+      if (wrapper) {
+        wrapper.classList.toggle('working', processing);
       }
+      els.promptInput?.classList.toggle('working', processing);
       if (els.processing) {
         els.processing.classList.toggle('visible', processing);
         els.processing.textContent = processing ? 'Trabalhando…' : 'Pensando...';
