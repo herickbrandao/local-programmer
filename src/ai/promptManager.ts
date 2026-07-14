@@ -180,9 +180,9 @@ export class PromptManager {
       '',
       '## Como ler o projeto',
       '- Com pasta aberta: use read_files / read_file / search_files / list_files (leem a memória RAM do host e, se precisar, o disco).',
-      '- Se já houver trechos pré-carregados na conversa, analise com base neles antes de pedir mais leitura.',
+      '- Se já houver trechos pré-carregados, use-os para orientar; se o trecho alvo não estiver completo, leia de novo com tools.',
       '- Só diga que não tem acesso quando for verdade: sem workspace, arquivo fora do projeto, ou a tool retornou erro/ausência.',
-      '- Não invente conteúdo nem peça ao usuário para abrir arquivos que você ainda não tentou ler.',
+      '- Não invente código: edite só com base em linhas N| reais do pré-carregamento ou do retorno das tools.',
     ].join('\n');
 
     if (toolsMode === 'agent' && intent === 'project_write') {
@@ -295,7 +295,9 @@ ${contextSection}${taskSection}`;
       : `
 ## Fase: EXPLORAÇÃO
 - Para vários arquivos: UMA chamada **read_files** com paths:[...] — nunca um por iteração
-- Se o contexto já veio pré-carregado, NÃO releia os mesmos arquivos
+- Se o contexto pré-carregado já tiver o trecho exato (com numeração N|), use-o
+- Se faltar linhas, aparecer "… há mais", ou o alvo não estiver visível: leia de novo com read_files/read_file antes de editar
+- Nunca invente código que não veio do pré-carregamento ou das tools
 - Depois edite com **edit_file** — mudanças mínimas e precisas
 - Valide com **test_project** quando terminar`;
 

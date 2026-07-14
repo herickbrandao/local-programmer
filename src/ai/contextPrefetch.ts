@@ -3,7 +3,6 @@ import { extractFilenamesFromPrompt } from './taskCompletion';
 import { parseLineCitations } from './lineCitations';
 import { batchReadFiles } from '../tools/readFiles';
 import { resolveWorkspacePath } from '../tools/pathUtils';
-import { FileReadCoverageMap, recordReadRange } from '../tools/fileReadChunks';
 import { TaskState } from './taskTracker';
 import type { ProjectMemory } from '../workspace/projectMemory';
 
@@ -29,14 +28,11 @@ const AGENT_HINT_FILES = [
   'src/ai/promptManager.ts',
 ];
 
-/** Sempre úteis quando o pedido é genérico (“melhorar o projeto”) */
-const DEFAULT_SEED_FILES = [
+/** Só quando não há nenhum path explícito/hint — e ainda assim poucos arquivos */
+const FALLBACK_SEED_FILES = [
   'package.json',
-  'tsconfig.json',
   'README.md',
   'src/extension.ts',
-  'src/ai/agentController.ts',
-  'src/ai/promptManager.ts',
 ];
 
 async function fileExists(workspaceRoot: string, rel: string): Promise<boolean> {
@@ -69,17 +65,17 @@ function searchMemoryPaths(projectMemory: ProjectMemory | undefined, goal: strin
   const tokens = goal
     .toLowerCase()
     .split(/[^a-z0-9_./-]+/i)
-    .filter((t) => t.length >= 4)
-    .slice(0, 6);
+    .filter((t) => t.length >= 5)
+    .slice(0, 5);
   const found = new Set<string>();
   for (const token of tokens) {
-    for (const hit of projectMemory.search(token, 8)) {
+    for (const hit of projectMemory.search(token, 6)) {
       const path = hit.split(':')[0];
-      if (path) {
+      if (path && !/\.(md|json|svg)$/i.test(path)) {
         found.add(path);
       }
     }
-    if (found.size >= 6) {
+    if (found.size >= 4) {
       break;
     }
   }
@@ -99,7 +95,7 @@ export async function inferPrefetchPaths(
     .filter((p) => !p.startsWith('msg:'));
 
   const hints: string[] = [];
-  if (/perform|otimiz|lent|rápid|rapido|veloc|token|itera|loop|projeto/i.test(goal)) {
+  if (/perform|otimiz|lent|rápid|rapido|veloc|token|itera|loop/i.test(goal)) {
     hints.push(...PERF_HINT_FILES);
   }
   if (/ui|painel|chat|layout|accordion|visual|css/i.test(goal)) {
@@ -110,95 +106,86 @@ export async function inferPrefetchPaths(
   }
 
   const fromMemorySearch = searchMemoryPaths(projectMemory, goal);
-  const candidates = [
-    ...new Set([
-      ...cited,
-      ...named,
-      ...atPaths,
-      ...hints,
-      ...fromMemorySearch,
-      ...DEFAULT_SEED_FILES,
-    ]),
+  const primary = [
+    ...new Set([...cited, ...named, ...atPaths, ...hints, ...fromMemorySearch]),
   ];
+
+  const candidates =
+    primary.length > 0
+      ? primary
+      : FALLBACK_SEED_FILES;
 
   const fromRam = pathsFromMemory(projectMemory, candidates);
   if (fromRam.length > 0) {
-    return fromRam.slice(0, 6);
+    return fromRam.slice(0, 4);
   }
 
   const existing: string[] = [];
-  for (const path of candidates.slice(0, 12)) {
+  for (const path of candidates.slice(0, 10)) {
     if (await fileExists(workspaceRoot, path)) {
       existing.push(path);
     }
   }
-  return existing.slice(0, 6);
+  return existing.slice(0, 4);
 }
 
 export interface PrefetchResult {
   applied: boolean;
   paths: string[];
   output: string;
+  hasMore: boolean;
 }
 
 /**
- * Pré-carrega trechos no disco em paralelo e registra cobertura —
- * o modelo já recebe contexto sem pedir read_file um a um.
+ * Pré-carrega trechos para o modelo analisar mais rápido.
+ * NÃO marca cobertura de leitura no TaskState — evita forceImplement /
+ * “arquivo pronto para editar” com só o topo do arquivo.
  */
 export async function prefetchProjectContext(
   workspaceRoot: string,
   goal: string,
-  taskState: TaskState,
+  _taskState: TaskState,
   projectMemory?: ProjectMemory
 ): Promise<PrefetchResult> {
   const paths = await inferPrefetchPaths(workspaceRoot, goal, projectMemory);
   if (paths.length === 0) {
-    return { applied: false, paths: [], output: '' };
+    return { applied: false, paths: [], output: '', hasMore: false };
   }
 
   const result = await batchReadFiles(workspaceRoot, paths, {
-    maxLinesPerFile: 70,
-    fileReadCoverage: taskState.fileReadCoverage,
+    maxLinesPerFile: 100,
     projectMemory,
   });
 
   const data = result.data as {
-    files?: Array<{ path?: string; startLine?: number; endLine?: number; totalLines?: number }>;
+    files?: Array<{ hasMore?: boolean }>;
     paths?: string[];
   } | undefined;
 
-  for (const file of data?.files ?? []) {
-    if (!file.path || !file.startLine || !file.endLine) {
-      continue;
-    }
-    taskState.filesRead.add(file.path);
-    recordReadRange(
-      taskState.fileReadCoverage,
-      file.path,
-      file.startLine,
-      file.endLine,
-      file.totalLines ?? file.endLine
-    );
-  }
+  const hasMore = (data?.files ?? []).some((f) => f.hasMore);
 
   return {
     applied: result.success,
     paths: data?.paths ?? paths,
     output: result.output,
+    hasMore,
   };
 }
 
 export function formatPrefetchMessage(prefetch: PrefetchResult): string {
-  return [
+  const lines = [
     '[Contexto lido da memória RAM / disco — lote]',
-    `Arquivos: ${prefetch.paths.join(', ')}`,
+    `Arquivos (trechos iniciais): ${prefetch.paths.join(', ')}`,
     '',
-    'Estes trechos já foram lidos pelo host. Analise com base neles.',
-    'Se precisar de outro arquivo, chame read_files (cai na RAM e, se faltar, no disco).',
-    'Só declare falta de acesso se uma leitura específica falhar.',
-    '',
-    prefetch.output,
-  ].join('\n');
+    'Isto é um ADIANTAMENTO parcial — não é o arquivo inteiro.',
+    'Use estes trechos para orientar a análise.',
+    'Antes de edit_file: se o trecho alvo não estiver abaixo (ou houver “… há mais”),',
+    'chame read_files/read_file com start_line/end_line no intervalo certo.',
+    'NUNCA invente código que não apareceu nestes trechos ou no retorno das tools.',
+  ];
+  if (prefetch.hasMore) {
+    lines.push('ATENÇÃO: um ou mais arquivos têm mais linhas — continue_read ou start_line=N é obrigatório antes de editar o resto.');
+  }
+  lines.push('', prefetch.output);
+  return lines.join('\n');
 }
-
-export type { FileReadCoverageMap };

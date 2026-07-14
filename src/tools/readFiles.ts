@@ -49,8 +49,10 @@ async function readOne(
   const fullPath = resolveWorkspacePath(context.workspaceRoot, filePath);
 
   try {
-    const cached = context.projectMemory?.get(filePath);
-    const content = cached?.content ?? await fs.readFile(fullPath, 'utf-8');
+    const fromRam = context.projectMemory
+      ? await context.projectMemory.getFreshContent(filePath)
+      : undefined;
+    const content = fromRam ?? await fs.readFile(fullPath, 'utf-8');
     const allLines = content.split('\n');
     const totalLines = allLines.length;
     const fileCoverage = context.fileReadCoverage?.[filePath];

@@ -146,10 +146,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const wsRoot = folders?.[0]?.uri.fsPath;
     this.sessionManager.updateWorkspace(wsRoot);
 
+    let memStatus = '';
     if (wsRoot) {
       await this.snapshotManager.initialize(wsRoot);
       this.rollbackManager = new RollbackManager(this.snapshotManager, wsRoot);
-      await this.agent.refreshProjectMemory(true);
+      memStatus = await this.agent.refreshProjectMemory(true);
     }
 
     this.currentSession = await this.sessionManager.getOrCreateActiveSession();
@@ -163,6 +164,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       sessions: await this.sessionManager.listSessions(),
       uiMessages: this.uiMessages.map((m) => this.serializeUiMessage(m)),
     });
+
+    if (memStatus) {
+      // Só na UI — não grava no histórico da conversa
+      this.postMessage({
+        type: 'memory_status',
+        content: `💾 ${memStatus} — tools leem da RAM; o prompt não recebe o repo inteiro.`,
+      });
+    }
   }
 
   private async loadModels(): Promise<void> {

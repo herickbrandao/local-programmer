@@ -149,8 +149,40 @@ export class ProjectMemory {
 
   get(relPath: string): MemoryFileEntry | undefined {
     const key = normalizeRel(relPath);
-    return this.files.get(key)
-      ?? [...this.files.entries()].find(([k]) => k.endsWith(`/${key}`) || key.endsWith(`/${k}`))?.[1];
+    const exact = this.files.get(key);
+    if (exact) {
+      return exact;
+    }
+    // Sufixo só se for match único — evita pegar outro **/types.ts
+    const suffixHits = [...this.files.entries()].filter(
+      ([k]) => k === key || k.endsWith(`/${key}`)
+    );
+    if (suffixHits.length === 1) {
+      return suffixHits[0][1];
+    }
+    return undefined;
+  }
+
+  /**
+   * Conteúdo da RAM; se o disco estiver mais novo, atualiza e devolve fresco.
+   * Undefined = não está na memória (caller lê o disco).
+   */
+  async getFreshContent(relPath: string): Promise<string | undefined> {
+    const entry = this.get(relPath);
+    if (!entry || !this.root) {
+      return entry?.content;
+    }
+    try {
+      const abs = path.join(this.root, entry.path);
+      const st = await fs.stat(abs);
+      if (st.mtimeMs > entry.mtimeMs + 1) {
+        await this.refreshFile(entry.path);
+        return this.get(entry.path)?.content;
+      }
+    } catch {
+      // usa cache
+    }
+    return entry.content;
   }
 
   has(relPath: string): boolean {

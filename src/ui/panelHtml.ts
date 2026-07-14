@@ -561,8 +561,18 @@ export function getPanelHtml(): string {
       font-style: italic;
       padding: 4px 12px;
       display: none;
+      font-variant-numeric: tabular-nums;
     }
     .processing-indicator.visible { display: block; }
+    .message.timing-meta {
+      align-self: flex-start;
+      font-size: 11px;
+      color: var(--vscode-descriptionForeground);
+      opacity: 0.9;
+      padding: 2px 10px 6px;
+      margin-top: -2px;
+      font-variant-numeric: tabular-nums;
+    }
     option.inactive { color: var(--vscode-errorForeground); }
     .token-wrap { position: relative; margin-left: auto; }
     .token-btn {
@@ -793,6 +803,7 @@ export function getPanelHtml(): string {
       messageById: {},
       activity: { el: null, body: null, summary: null, wrap: null, count: 0 },
       streaming: { el: null, content: '' },
+      timing: { startedAt: 0, timerId: null, stopping: false },
     };
 
     const els = {
@@ -1547,6 +1558,57 @@ export function getPanelHtml(): string {
       els.messages.scrollTop = els.messages.scrollHeight;
     }
 
+    function formatDuration(ms) {
+      if (!ms || ms < 0) return '0s';
+      if (ms < 10000) {
+        return (Math.round(ms / 100) / 10).toFixed(1) + 's';
+      }
+      const totalSec = Math.round(ms / 1000);
+      if (totalSec < 60) return totalSec + 's';
+      const m = Math.floor(totalSec / 60);
+      const s = totalSec % 60;
+      return m + 'm ' + (s < 10 ? '0' : '') + s + 's';
+    }
+
+    function clearTimingTick() {
+      if (state.timing.timerId) {
+        clearInterval(state.timing.timerId);
+        state.timing.timerId = null;
+      }
+    }
+
+    function startResponseTimer() {
+      clearTimingTick();
+      state.timing.startedAt = Date.now();
+      state.timing.stopping = false;
+      const tick = () => {
+        if (!state.timing.startedAt || !els.processing) return;
+        const elapsed = Date.now() - state.timing.startedAt;
+        const label = state.timing.stopping ? 'Parando… ' : 'Trabalhando… ';
+        els.processing.textContent = label + formatDuration(elapsed);
+      };
+      tick();
+      state.timing.timerId = setInterval(tick, 200);
+    }
+
+    function finishResponseTimer(showInChat) {
+      if (!state.timing.startedAt) {
+        clearTimingTick();
+        return;
+      }
+      const elapsed = Date.now() - state.timing.startedAt;
+      clearTimingTick();
+      state.timing.startedAt = 0;
+      if (showInChat && elapsed > 0) {
+        const div = document.createElement('div');
+        div.className = 'message timing-meta';
+        div.textContent = '⏱ ' + formatDuration(elapsed);
+        div.title = 'Tempo até a resposta final';
+        els.messages.appendChild(div);
+        els.messages.scrollTop = els.messages.scrollHeight;
+      }
+    }
+
     function setProcessing(processing) {
       state.isProcessing = processing;
       els.sendBtn.disabled = processing;
@@ -1555,11 +1617,18 @@ export function getPanelHtml(): string {
         wrapper.classList.toggle('working', processing);
       }
       els.promptInput?.classList.toggle('working', processing);
-      if (els.processing) {
-        els.processing.classList.toggle('visible', processing);
-        els.processing.textContent = processing ? 'Trabalhando…' : 'Pensando...';
-      }
-      if (!processing) {
+      if (processing) {
+        startResponseTimer();
+        if (els.processing) {
+          els.processing.classList.add('visible');
+        }
+      } else {
+        const hadTimer = !!state.timing.startedAt || !!state.timing.timerId;
+        finishResponseTimer(hadTimer);
+        if (els.processing) {
+          els.processing.classList.remove('visible');
+          els.processing.textContent = 'Pensando...';
+        }
         sealActivityAccordion();
       }
     }
@@ -1568,7 +1637,11 @@ export function getPanelHtml(): string {
     els.sendBtn.addEventListener('click', send);
     els.stopBtn?.addEventListener('click', () => {
       vscode.postMessage({ type: 'stop' });
-      if (els.processing) els.processing.textContent = 'Parando…';
+      state.timing.stopping = true;
+      if (els.processing && state.timing.startedAt) {
+        els.processing.textContent =
+          'Parando… ' + formatDuration(Date.now() - state.timing.startedAt);
+      }
     });
     els.promptInput.addEventListener('keydown', e => {
       if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
@@ -1654,7 +1727,24 @@ export function getPanelHtml(): string {
         case 'load_session':
           renderAllMessages(msg.uiMessages);
           updateSessionBar(msg.session, msg.sessions);
-          setProcessing(false);
+          clearTimingTick();
+          state.timing.startedAt = 0;
+          state.isProcessing = false;
+          els.sendBtn.disabled = false;
+          els.promptInput?.closest('.input-wrapper')?.classList.remove('working');
+          els.promptInput?.classList.remove('working');
+          if (els.processing) {
+            els.processing.classList.remove('visible');
+            els.processing.textContent = 'Pensando...';
+          }
+          break;
+        case 'memory_status':
+          if (msg.content) {
+            addMessage(msg.content, 'system');
+            if (els.status) {
+              els.status.textContent = String(msg.content).replace(/^💾\\s*/, '');
+            }
+          }
           break;
         case 'sessions_updated':
           updateSessionBar({ id: msg.activeSessionId || state.activeSessionId }, msg.sessions);
